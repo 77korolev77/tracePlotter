@@ -1,0 +1,2294 @@
+#!/usr/bin/env python3
+"""
+TRC Signal Plotter — PyQtGraph edition.
+
+GUI для построения сигналов из .trc (PCAN) файлов по описанию .dbc.
+Заголовок графика, подписи осей и подписи в легенде редактируются
+непосредственно в окне графика. Фон графика настраивается. Есть
+дерево кривых с чекбоксами видимости.
+
+Масштабирование мышью: ЛКМ-протяжка (область), Shift+ЛКМ (только X),
+Ctrl+ЛКМ (только Y), ПКМ — панорамирование.
+
+Зависимости: PyQt5, pyqtgraph, numpy.
+Опционально: scipy (экспорт .mat).
+"""
+
+import sys
+import os
+import re
+import json
+from collections import defaultdict
+
+import numpy as np
+
+from PyQt5.QtCore import (
+    Qt, QThread, pyqtSignal, QTimer, QPointF, QRectF,
+)
+from PyQt5.QtGui import QColor, QFont
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QLabel, QLineEdit, QPushButton, QComboBox, QCheckBox, QTreeWidget,
+    QTreeWidgetItem, QSplitter, QTabWidget, QPlainTextEdit, QFileDialog,
+    QColorDialog, QMessageBox, QProgressBar, QDialog, QGroupBox,
+    QFormLayout, QGridLayout, QAbstractItemView,
+)
+
+import pyqtgraph as pg
+
+try:
+    from scipy.io import savemat as scipy_savemat
+    HAS_SCIPY = True
+except ImportError:
+    scipy_savemat = None
+    HAS_SCIPY = False
+
+
+# ---------------------------------------------------------------------------
+# Константы
+# ---------------------------------------------------------------------------
+DEFAULT_COLOR = (0.0, 0.4470, 0.7410)
+MATLAB_LINES = [
+    (0.0000, 0.4470, 0.7410),
+    (0.8500, 0.3250, 0.0980),
+    (0.9290, 0.6940, 0.1250),
+    (0.4940, 0.1840, 0.5560),
+    (0.4660, 0.6740, 0.1880),
+    (0.3010, 0.7450, 0.9330),
+    (0.6350, 0.0780, 0.1840),
+]
+PREFS_PATH = os.path.join(os.path.expanduser('~'), '.trc_plotter_prefs.json')
+
+LINE_STYLES = {
+    '-': Qt.SolidLine,
+    '--': Qt.DashLine,
+    ':': Qt.DotLine,
+    '-.': Qt.DashDotLine,
+}
+
+MARKERS = ['none', 'o', 's', 't', 'd', '+', 'x', 'p', 'h', 'star']
+
+
+# ---------------------------------------------------------------------------
+# Разбор DBC
+# ---------------------------------------------------------------------------
+def parse_dbc(filename):
+    messages = []
+    cur_msg = None
+    re_bo = re.compile(r'^BO_ (\d+) (\w+)\s*:\s*(\d+)')
+    re_sg = re.compile(
+        r'^\s*SG_\s+(\w+)\s*:\s*(\d+)\|(\d+)@(\d)([+-])\s*'
+        r'\(\s*([^,]+)\s*,\s*([^)]+)\s*\)\s*\[[^\]]*\]\s*"([^"]*)"'
+    )
+    with open(filename, 'r', encoding='latin-1', errors='replace') as f:
+        for line in f:
+            line = line.rstrip('\n\r')
+            m = re_bo.match(line)
+            if m:
+                id_raw = int(m.group(1))
+                cur_msg = {
+                    'id': id_raw & 0x1FFFFFFF,
+                    'name': m.group(2),
+                    'dlc': int(m.group(3)),
+                    'signals': [],
+                }
+                messages.append(cur_msg)
+                continue
+            m = re_sg.match(line)
+            if m and cur_msg is not None:
+                cur_msg['signals'].append({
+                    'name': m.group(1),
+                    'start': int(m.group(2)),
+                    'len': int(m.group(3)),
+                    'byteorder': m.group(4),
+                    'sign': m.group(5),
+                    'scale': float(m.group(6)),
+                    'offset': float(m.group(7)),
+                    'unit': m.group(8),
+                })
+    return {'messages': messages}
+
+
+# ---------------------------------------------------------------------------
+# Разбор TRC
+# ---------------------------------------------------------------------------
+def parse_can_log(filename, progress_cb=None, progress_value_cb=None):
+    def _p(msg):
+        if progress_cb:
+            progress_cb(msg)
+
+    def _pv(val):
+        if progress_value_cb:
+            try:
+                progress_value_cb(val)
+            except Exception:
+                pass
+
+    _pv(0.0)
+    messages = []
+    try:
+        size = os.path.getsize(filename)
+    except OSError:
+        size = 0
+    _p(f'Открыт файл: {filename}')
+    _p(f'Размер файла: {size} байт')
+
+    file_version = None
+    try:
+        with open(filename, 'r', encoding='latin-1', errors='replace') as f:
+            for line in f:
+                if line.startswith('$FILEVERSION'):
+                    m = re.search(r'=\s*(\d+)\.(\d+)', line)
+                    if m:
+                        file_version = (int(m.group(1)), int(m.group(2)))
+                    break
+                s = line.strip()
+                if not s or (not s.startswith(';') and not s.startswith('$')):
+                    break
+    except OSError as e:
+        _pv(100.0)
+        raise RuntimeError(f'Не удалось открыть файл: {e}')
+
+    if file_version:
+        _p(f'Формат TRC: версия {file_version[0]}.{file_version[1]}')
+    else:
+        _p('Формат TRC: версия в заголовке не указана (автоопределение).')
+
+    line_count = 0
+    last_percent = -1
+    with open(filename, 'r', encoding='latin-1', errors='replace') as f:
+        for raw in f:
+            line_count += 1
+            line = raw.rstrip('\n\r')
+            if not line:
+                continue
+
+            if line_count % 5000 == 0 and size > 0:
+                try:
+                    percent = int(100 * f.tell() / size)
+                except OSError:
+                    percent = last_percent
+                if percent != last_percent and percent % 5 == 0:
+                    last_percent = percent
+                    _p(f'Разбор: {percent:3d}%  (строк: {line_count}, найдено: {len(messages)})')
+                    _pv(float(percent))
+
+            if line[0] in ';-$':
+                continue
+            tokens = line.strip().split()
+            n = len(tokens)
+            if n < 5:
+                continue
+
+            if n >= 7 and tokens[2] == 'DT' and tokens[4] in ('Rx', 'Tx'):
+                has_num = True
+                id_idx, dlc_idx, data_idx = 3, 5, 6
+            elif n >= 6 and tokens[2] in ('Rx', 'Tx'):
+                has_num = True
+                id_idx, dlc_idx, data_idx = 3, 4, 5
+            elif tokens[1] in ('Rx', 'Tx'):
+                has_num = False
+                id_idx, dlc_idx, data_idx = 2, 3, 4
+            else:
+                continue
+
+            try:
+                if has_num:
+                    num_str = tokens[0].rstrip(')')
+                    msg_num = float(num_str)
+                    t = float(tokens[1])
+                else:
+                    msg_num = len(messages) + 1
+                    t = float(tokens[0])
+                id_str = tokens[id_idx]
+                dlc = int(float(tokens[dlc_idx]))
+            except (ValueError, IndexError):
+                continue
+
+            if dlc < 0:
+                dlc = 0
+            if dlc > 8:
+                dlc = 8
+
+            id_clean = id_str.lower()
+            if id_clean.startswith('0x'):
+                id_clean = id_clean[2:]
+            try:
+                id_val = int(id_clean, 16)
+            except ValueError:
+                continue
+
+            data = np.zeros(8, dtype=np.uint8)
+            n_avail = min(n - data_idx, 8)
+            ok = True
+            for k in range(n_avail):
+                try:
+                    data[k] = int(tokens[data_idx + k], 16) & 0xFF
+                except ValueError:
+                    ok = False
+                    break
+            if not ok:
+                continue
+
+            messages.append({
+                'num': msg_num, 'time': t,
+                'id': id_str, 'id_val': id_val, 'data': data,
+            })
+
+    _p(f'Разбор завершён: {len(messages)} сообщений.')
+    _pv(100.0)
+    return messages
+
+
+def extract_intel(data, start_bit, length, is_signed, scale, offset):
+    raw = 0
+    for i in range(length):
+        bp = start_bit + i
+        byte_idx = bp // 8
+        bit_idx = bp % 8
+        if byte_idx >= len(data):
+            return float('nan')
+        b = (int(data[byte_idx]) >> bit_idx) & 1
+        raw |= b << i
+    if is_signed and raw >= (1 << (length - 1)):
+        raw -= (1 << length)
+    return raw * scale + offset
+
+
+def extract_motorola(data, start_bit, length, is_signed, scale, offset):
+    raw = 0
+    bp = start_bit
+    for _ in range(length):
+        byte_idx = bp // 8
+        bit_idx = bp % 8
+        if byte_idx >= len(data):
+            return float('nan')
+        b = (int(data[byte_idx]) >> bit_idx) & 1
+        raw = (raw << 1) | b
+        bp = bp + 15 if bit_idx == 0 else bp - 1
+    if is_signed and raw >= (1 << (length - 1)):
+        raw -= (1 << length)
+    return raw * scale + offset
+
+
+# ---------------------------------------------------------------------------
+# Утилиты
+# ---------------------------------------------------------------------------
+def shade_variants(base, n):
+    if n <= 0:
+        return []
+    if n == 1:
+        return [base]
+    base = np.array(base[:3], dtype=float)
+    out = []
+    for f in np.linspace(0.0, 0.6, n):
+        out.append((1 - f) * base + f * np.ones(3))
+    return out
+
+
+def rgb_to_qcolor(rgb):
+    return QColor(int(max(0, min(1, rgb[0])) * 255),
+                  int(max(0, min(1, rgb[1])) * 255),
+                  int(max(0, min(1, rgb[2])) * 255))
+
+
+def load_prefs():
+    try:
+        with open(PREFS_PATH, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_prefs(p):
+    try:
+        with open(PREFS_PATH, 'w', encoding='utf-8') as f:
+            json.dump(p, f, indent=2)
+    except Exception:
+        pass
+
+
+def sanitize_var_name(s):
+    if not s:
+        return 'signal'
+    v = re.sub(r'\W', '_', s)
+    if not v or not (v[0].isalpha() or v[0] == '_'):
+        v = 's_' + v
+    return v
+
+
+def sanitize_filename(s, default='signals', ext=''):
+    s = (s or '').strip()
+    if not s:
+        s = default
+    if ext and not s.lower().endswith(ext):
+        s += ext
+    s = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', s)
+    return s
+
+
+def make_pen(color, width, style):
+    if style == 'none':
+        return None
+    qt_style = LINE_STYLES.get(style, Qt.SolidLine)
+    return pg.mkPen(color=color, width=width, style=qt_style)
+
+
+# ---------------------------------------------------------------------------
+# ViewBox с выделением области
+# ---------------------------------------------------------------------------
+class TRCViewBox(pg.ViewBox):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setMouseMode(pg.ViewBox.RectMode)
+
+    def mouseDragEvent(self, ev, axis=None):
+        if (ev.button() == Qt.LeftButton and
+                self.state.get('mouseMode') == pg.ViewBox.RectMode):
+            mods = ev.modifiers()
+            x_only = bool(mods & Qt.ShiftModifier)
+            y_only = bool(mods & Qt.ControlModifier)
+
+            start = QPointF(ev.buttonDownPos())
+            end = QPointF(ev.pos())
+
+            if x_only and not y_only:
+                br = self.boundingRect()
+                start = QPointF(start.x(), br.top())
+                end = QPointF(end.x(), br.bottom())
+            elif y_only and not x_only:
+                br = self.boundingRect()
+                start = QPointF(br.left(), start.y())
+                end = QPointF(br.right(), end.y())
+
+            self.updateScaleBox(start, end)
+
+            if ev.isFinish():
+                self.rbScaleBox.hide()
+                ax = QRectF(start, end)
+                ax = self.childGroup.mapRectFromParent(ax)
+                self.showAxRect(ax)
+                self.axHistoryPointer += 1
+                self.axHistory = (
+                    self.axHistory[:self.axHistoryPointer] + [ax])
+            return
+        super().mouseDragEvent(ev, axis)
+
+
+# ---------------------------------------------------------------------------
+# Мульти-осевой виджет
+# ---------------------------------------------------------------------------
+class MultiAxisPlotWidget(pg.GraphicsLayoutWidget):
+    """
+    Главная ось Y — стандартная левая ось PlotItem.
+    Дополнительные оси Y — ViewBox + AxisItem справа, ПОВЕРХ главной оси
+    (z-value выше, чем у главного ViewBox — это гарантирует видимость).
+    """
+    AXIS_WIDTH = 60
+    Z_BASE = 1000
+
+    def __init__(self):
+        super().__init__()
+        self.main_plot = self.addPlot(row=0, col=0, viewBox=TRCViewBox())
+        self.main_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.main_plot.setLabel('bottom', 'Время, с')
+
+        # Отключаем авто-скейл у главной оси
+        self.main_plot.getViewBox().disableAutoRange()
+
+        self.legend = self.main_plot.addLegend(offset=(-10, 10))
+        self.legend.setVisible(False)
+
+        self.extra_axes = []
+        self._resize_connected = False
+
+    def ensure_axes(self, n):
+        while len(self.extra_axes) + 1 < n:
+            self._add_axis()
+
+    def _add_axis(self):
+        idx = len(self.extra_axes)
+
+        vb = pg.ViewBox()
+        vb.setXLink(self.main_plot)
+        vb.disableAutoRange()
+        vb.setZValue(self.Z_BASE + idx)          # ПОВЕРХ главного ViewBox
+        vb.setBackgroundColor(None)               # прозрачный фон
+        self.main_plot.scene().addItem(vb)
+
+        axis = pg.AxisItem('right')
+        axis.setZValue(self.Z_BASE + idx)         # ось тоже поверх
+        self.main_plot.scene().addItem(axis)
+        axis.linkToView(vb)
+
+        self.extra_axes.append({'vb': vb, 'axis': axis})
+
+        right_margin = len(self.extra_axes) * self.AXIS_WIDTH
+        self.main_plot.setContentsMargins(0, 0, right_margin, 0)
+
+        if not self._resize_connected:
+            self.main_plot.vb.sigResized.connect(self._update_positions)
+            self._resize_connected = True
+
+        # Синхронизируем начальный X-диапазон
+        try:
+            vb.linkedViewChanged(self.main_plot.vb, vb.XAxis)
+        except Exception:
+            pass
+
+        self._update_positions()
+        QTimer.singleShot(0, self._update_positions)
+
+    def _update_positions(self):
+        try:
+            main_rect = self.main_plot.vb.sceneBoundingRect()
+        except Exception:
+            return
+        if main_rect.width() <= 0 or main_rect.height() <= 0:
+            return
+        for i, info in enumerate(self.extra_axes):
+            info['vb'].setGeometry(main_rect)
+            info['axis'].setGeometry(
+                int(main_rect.right() + i * self.AXIS_WIDTH),
+                int(main_rect.top()),
+                self.AXIS_WIDTH,
+                int(main_rect.height()),
+            )
+            info['axis'].setHeight(int(main_rect.height()))
+
+    def clear_all_curves(self):
+        self.legend.clear()
+        self.main_plot.clear()
+        for info in self.extra_axes:
+            info['vb'].clear()
+            self.main_plot.scene().removeItem(info['vb'])
+            self.main_plot.scene().removeItem(info['axis'])
+        self.extra_axes = []
+        self.main_plot.setContentsMargins(0, 0, 0, 0)
+
+    def add_curve(self, axis_idx, x, y, pen, symbol, symbol_size, legend_label):
+        if axis_idx == 0:
+            curve = self.main_plot.plot(
+                x, y, pen=pen, symbol=symbol, symbolSize=symbol_size)
+        else:
+            if axis_idx - 1 >= len(self.extra_axes):
+                return None
+            info = self.extra_axes[axis_idx - 1]
+            curve = pg.PlotDataItem(
+                x, y, pen=pen, symbol=symbol, symbolSize=symbol_size)
+            info['vb'].addItem(curve)
+        self.legend.addItem(curve, legend_label)
+        return curve
+
+    def set_axis_style(self, axis_idx, label, color):
+        if axis_idx == 0:
+            ax = self.main_plot.getAxis('left')
+        else:
+            if axis_idx - 1 >= len(self.extra_axes):
+                return
+            ax = self.extra_axes[axis_idx - 1]['axis']
+
+        if isinstance(color, QColor):
+            qcolor = color
+        elif isinstance(color, (tuple, list)):
+            qcolor = QColor(int(color[0]), int(color[1]), int(color[2]))
+        else:
+            qcolor = QColor(color)
+
+        pen = pg.mkPen(qcolor)
+        ax.setPen(pen)
+        ax.setTextPen(pen)
+        try:
+            ax.setLabel(label, color=qcolor.name())
+        except Exception:
+            ax.setLabel(label)
+
+    def set_legend_visible(self, visible):
+        self.legend.setVisible(visible)
+
+    def set_ylim(self, axis_idx, ymin, ymax):
+        if axis_idx == 0:
+            vb = self.main_plot.vb
+        else:
+            if axis_idx - 1 >= len(self.extra_axes):
+                return
+            vb = self.extra_axes[axis_idx - 1]['vb']
+        vb.setYRange(ymin, ymax, padding=0)
+
+    def set_xlim(self, xmin, xmax):
+        self.main_plot.setXRange(xmin, xmax, padding=0)
+
+
+# ---------------------------------------------------------------------------
+# Окно графика
+# ---------------------------------------------------------------------------
+class PlotWindow(QDialog):
+    closed = pyqtSignal(object)
+    state_changed = pyqtSignal()
+
+    def __init__(self, app, index, title, background_color=None):
+        super().__init__()
+        self.app = app
+        self.index = index
+        self.window_title = title
+        self.setWindowTitle(title)
+        self.resize(1100, 860)
+
+        self.plots_per_axes = [[]]
+        self.axes_colors = [None]
+        self.y_limits = [[None, None]]
+        self.x_limits = [None, None]
+        self.axis_labels = [None]
+        self.custom_title = None
+        self.show_legend = False
+        self.background_color = background_color
+        self._fg_qcolor = QColor('#000000')
+
+        self._curve_objects = {}
+        self._picked_color = None
+
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
+
+        self.plot_widget = MultiAxisPlotWidget()
+        layout.addWidget(self.plot_widget, stretch=1)
+
+        edit_panel = QGroupBox('Редактирование отображения')
+        edit_layout = QVBoxLayout(edit_panel)
+        edit_layout.setSpacing(4)
+
+        # Заголовок
+        row = QHBoxLayout()
+        row.addWidget(QLabel('Заголовок графика:'))
+        self.title_edit = QLineEdit()
+        self.title_edit.setPlaceholderText(
+            '(пусто = автоматический заголовок)')
+        row.addWidget(self.title_edit, stretch=1)
+        b = QPushButton('Применить')
+        b.clicked.connect(self.apply_title)
+        row.addWidget(b)
+        edit_layout.addLayout(row)
+
+        # Подпись оси
+        row = QHBoxLayout()
+        row.addWidget(QLabel('Подпись оси:'))
+        self.axis_combo = QComboBox()
+        self.axis_combo.setMinimumWidth(100)
+        self.axis_combo.currentIndexChanged.connect(self._on_axis_changed)
+        row.addWidget(self.axis_combo)
+        row.addWidget(QLabel('→'))
+        self.axis_label_edit = QLineEdit()
+        self.axis_label_edit.setPlaceholderText(
+            '(пусто = авто по имени сигнала)')
+        row.addWidget(self.axis_label_edit, stretch=1)
+        b = QPushButton('Применить')
+        b.clicked.connect(self.apply_axis_label)
+        row.addWidget(b)
+        edit_layout.addLayout(row)
+
+        # Подпись в легенде
+        row = QHBoxLayout()
+        row.addWidget(QLabel('Подпись в легенде:'))
+        self.curve_combo = QComboBox()
+        self.curve_combo.setMinimumWidth(240)
+        self.curve_combo.currentIndexChanged.connect(self._on_curve_changed)
+        row.addWidget(self.curve_combo)
+        row.addWidget(QLabel('→'))
+        self.legend_edit = QLineEdit()
+        self.legend_edit.setPlaceholderText('(пусто = авто)')
+        row.addWidget(self.legend_edit, stretch=1)
+        b = QPushButton('Применить')
+        b.clicked.connect(self.apply_legend_label)
+        row.addWidget(b)
+        edit_layout.addLayout(row)
+
+        # Стиль
+        row = QHBoxLayout()
+        row.addWidget(QLabel('Цвет:'))
+        self.color_btn = QPushButton('Авто')
+        self.color_btn.clicked.connect(self.pick_color)
+        row.addWidget(self.color_btn)
+        b = QPushButton('Сброс')
+        b.clicked.connect(self.auto_color)
+        row.addWidget(b)
+        row.addWidget(QLabel('Тип:'))
+        self.line_style_combo = QComboBox()
+        self.line_style_combo.addItems(list(LINE_STYLES.keys()) + ['none'])
+        row.addWidget(self.line_style_combo)
+        row.addWidget(QLabel('Толщина:'))
+        self.line_width_combo = QComboBox()
+        self.line_width_combo.addItems(
+            ['0.5', '1', '1.5', '2', '2.5', '3', '4'])
+        self.line_width_combo.setCurrentText('1.5')
+        row.addWidget(self.line_width_combo)
+        row.addWidget(QLabel('Маркер:'))
+        self.marker_combo = QComboBox()
+        self.marker_combo.addItems(MARKERS)
+        row.addWidget(self.marker_combo)
+        row.addWidget(QLabel('Размер:'))
+        self.marker_size_combo = QComboBox()
+        self.marker_size_combo.addItems(
+            ['3', '4', '5', '6', '8', '10', '12'])
+        self.marker_size_combo.setCurrentText('6')
+        row.addWidget(self.marker_size_combo)
+        b = QPushButton('Применить стиль')
+        b.clicked.connect(self.apply_style)
+        row.addWidget(b)
+        edit_layout.addLayout(row)
+
+        # Легенда / удаление / очистка
+        row = QHBoxLayout()
+        self.legend_checkbox = QCheckBox('Показывать легенду на графике')
+        self.legend_checkbox.stateChanged.connect(self.toggle_legend)
+        row.addWidget(self.legend_checkbox)
+        row.addStretch()
+        b = QPushButton('Удалить выбранную кривую')
+        b.clicked.connect(self.delete_current_curve)
+        row.addWidget(b)
+        b = QPushButton('Очистить график')
+        b.clicked.connect(self.clear_plot)
+        row.addWidget(b)
+        edit_layout.addLayout(row)
+
+        hint = QLabel('Масштабирование мышью: ЛКМ-протяжка = область; '
+                      'Shift+ЛКМ = только по X; Ctrl+ЛКМ = только по Y; '
+                      'ПКМ = панорамирование')
+        hint.setStyleSheet('color: #777; font-size: 11px;')
+        hint.setWordWrap(True)
+        edit_layout.addWidget(hint)
+
+        layout.addWidget(edit_panel)
+
+        # Дерево кривых
+        curves_panel = QGroupBox('Кривые на графике')
+        cp = QVBoxLayout(curves_panel)
+        cp.setContentsMargins(4, 4, 4, 4)
+        self.curves_tree = QTreeWidget()
+        self.curves_tree.setHeaderLabels(['Видимость', 'Кривая', 'Ось'])
+        self.curves_tree.setRootIsDecorated(False)
+        self.curves_tree.setAlternatingRowColors(True)
+        self.curves_tree.setMaximumHeight(150)
+        self.curves_tree.setColumnWidth(0, 80)
+        self.curves_tree.setColumnWidth(1, 700)
+        self.curves_tree.setColumnWidth(2, 70)
+        self.curves_tree.itemChanged.connect(
+            self._on_curve_visibility_changed)
+        cp.addWidget(self.curves_tree)
+        row = QHBoxLayout()
+        b = QPushButton('Показать все')
+        b.clicked.connect(self._show_all_curves)
+        row.addWidget(b)
+        b = QPushButton('Скрыть все')
+        b.clicked.connect(self._hide_all_curves)
+        row.addWidget(b)
+        row.addStretch()
+        cp.addLayout(row)
+        layout.addWidget(curves_panel)
+
+    def closeEvent(self, event):
+        self.closed.emit(self)
+        super().closeEvent(event)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        try:
+            self.plot_widget._update_positions()
+        except Exception:
+            pass
+
+    def add_plots(self, new_plots, axis_choice, custom_color):
+        n_axes = len(self.plots_per_axes)
+        if axis_choice >= n_axes:
+            self.plots_per_axes.append(list(new_plots))
+            self.axes_colors.append(custom_color)
+            self.y_limits.append([None, None])
+            self.axis_labels.append(None)
+        else:
+            self.plots_per_axes[axis_choice].extend(new_plots)
+        self.redraw()
+
+    def set_background(self, qcolor):
+        self.background_color = qcolor
+        self.redraw()
+
+    def _is_dark_bg(self):
+        if self.background_color is None:
+            return False
+        bg = self.background_color
+        lum = 0.299 * bg.red() + 0.587 * bg.green() + 0.114 * bg.blue()
+        return lum < 128
+
+    @staticmethod
+    def _lighten(c):
+        return tuple(min(255, int(v * 0.65 + 255 * 0.35)) for v in c)
+
+    def _apply_theme(self):
+        if self.background_color is None:
+            bg = QColor('#ffffff')
+        else:
+            bg = self.background_color
+
+        lum = 0.299 * bg.red() + 0.587 * bg.green() + 0.114 * bg.blue()
+        fg = QColor('#000000') if lum > 128 else QColor('#ffffff')
+        self._fg_qcolor = fg
+
+        # Фон задаём ТОЛЬКО на уровне виджета — ViewBox'ы остаются
+        # прозрачными, поэтому кривые доп. осей видны поверх всего.
+        self.plot_widget.setBackground(bg)
+
+        for axis_name in ('bottom', 'top'):
+            axis = self.plot_widget.main_plot.getAxis(axis_name)
+            if axis is not None:
+                axis.setPen(fg)
+                axis.setTextPen(fg)
+
+        self.plot_widget.main_plot.setLabel(
+            'bottom', 'Время, с', color=fg.name())
+
+        legend = self.plot_widget.legend
+        try:
+            legend.setLabelTextColor(fg)
+        except Exception:
+            pass
+        try:
+            legend.setPen(pg.mkPen(fg))
+        except Exception:
+            pass
+        try:
+            legend.setBrush(pg.mkBrush(QColor(
+                bg.red(), bg.green(), bg.blue(), 220)))
+        except Exception:
+            pass
+
+    def redraw(self):
+        n_axes = len(self.plots_per_axes)
+
+        self.plot_widget.clear_all_curves()
+        self.plot_widget.ensure_axes(n_axes)
+        try:
+            self.plot_widget._update_positions()
+        except Exception:
+            pass
+        self._apply_theme()
+
+        dark = self._is_dark_bg()
+        self._curve_objects = {}
+
+        for ai, plots in enumerate(self.plots_per_axes):
+            custom = (self.axes_colors[ai]
+                      if ai < len(self.axes_colors) else None)
+            if custom is not None:
+                raw_colors = shade_variants(custom, max(len(plots), 1))
+                line_colors = [
+                    tuple(int(x * 255) for x in c[:3]) for c in raw_colors
+                ]
+                axis_color = tuple(int(c * 255) for c in custom[:3])
+            else:
+                line_colors = [
+                    tuple(int(c * 255) for c in
+                          MATLAB_LINES[k % len(MATLAB_LINES)])
+                    for k in range(max(len(plots), 1))
+                ]
+                axis_color = line_colors[0] if line_colors else (0, 0, 0)
+
+            if dark:
+                line_colors = [self._lighten(c) for c in line_colors]
+                axis_color = self._lighten(axis_color)
+
+            if ai < len(self.axis_labels) and self.axis_labels[ai]:
+                y_label = self.axis_labels[ai]
+            elif plots:
+                y_label = plots[0]['label']
+            else:
+                y_label = ''
+
+            self.plot_widget.set_axis_style(ai, y_label, axis_color)
+
+            for j, p in enumerate(plots):
+                c = p.get('color')
+                if c is None:
+                    c = line_colors[j % len(line_colors)]
+                else:
+                    c = tuple(int(x * 255) for x in c[:3])
+
+                ls = p.get('lineStyle', '-')
+                lw = p.get('lineWidth', 1.5)
+                mk = p.get('marker', 'none')
+                ms = float(p.get('markerSize', 6))
+
+                legend_lbl = (p.get('legend_label')
+                              or f"Ось {ai + 1}: {p['label']}")
+
+                pen = make_pen(c, lw, ls)
+                symbol = None if mk == 'none' else mk
+
+                try:
+                    curve = self.plot_widget.add_curve(
+                        ai, p['t'], p['v'], pen, symbol, ms, legend_lbl)
+                except Exception as e:
+                    self.app.log(f'Ошибка добавления кривой ({ai}/{j}): {e}')
+                    curve = None
+
+                if curve is not None:
+                    self._curve_objects[(ai, j)] = curve
+                    try:
+                        curve.setVisible(p.get('visible', True))
+                    except Exception:
+                        pass
+
+        if self.custom_title:
+            title_text = self.custom_title
+        else:
+            first_msg = self.plots_per_axes[0][0]['msgName'] \
+                if self.plots_per_axes[0] else '(пусто)'
+            total = sum(len(p) for p in self.plots_per_axes)
+            title_text = (f'График #{self.index} — {first_msg}  '
+                          f'({total} сигнал(ов), {n_axes} осей)')
+        self.plot_widget.main_plot.setTitle(
+            title_text, color=self._fg_qcolor.name())
+
+        self.plot_widget.set_legend_visible(self.show_legend)
+        self.legend_checkbox.blockSignals(True)
+        self.legend_checkbox.setChecked(self.show_legend)
+        self.legend_checkbox.blockSignals(False)
+
+        self._recompute_ranges()
+
+        try:
+            self.plot_widget._update_positions()
+        except Exception:
+            pass
+
+        self._refresh_axis_combo()
+        self._refresh_curve_combo()
+        self._refresh_curves_tree()
+
+        # Повторный пересчёт после того, как Qt закончит layout
+        QTimer.singleShot(10, self._recompute_ranges)
+
+        self.state_changed.emit()
+
+    def _recompute_ranges(self):
+        # X
+        xs = []
+        for plots in self.plots_per_axes:
+            for p in plots:
+                if p.get('visible', True):
+                    t = np.asarray(p['t'], dtype=float)
+                    t = t[np.isfinite(t)]
+                    if len(t):
+                        xs.append(t)
+
+        xmin, xmax = self.x_limits
+        if xs:
+            all_x = np.concatenate(xs)
+            if xmin is None:
+                xmin = float(all_x.min())
+            if xmax is None:
+                xmax = float(all_x.max())
+        if xmin is not None and xmax is not None:
+            if np.isfinite(xmin) and np.isfinite(xmax):
+                if xmin == xmax:
+                    xmin -= 1.0
+                    xmax += 1.0
+                if xmin < xmax:
+                    try:
+                        self.plot_widget.set_xlim(xmin, xmax)
+                    except Exception:
+                        pass
+
+        # Y по каждой оси
+        for ai, plots in enumerate(self.plots_per_axes):
+            ys = []
+            for p in plots:
+                if p.get('visible', True):
+                    v = np.asarray(p['v'], dtype=float)
+                    v = v[np.isfinite(v)]
+                    if len(v):
+                        ys.append(v)
+
+            ymin, ymax = (self.y_limits[ai]
+                          if ai < len(self.y_limits) else (None, None))
+
+            if ys:
+                all_y = np.concatenate(ys)
+                if ymin is None:
+                    ymin = float(all_y.min())
+                if ymax is None:
+                    ymax = float(all_y.max())
+            else:
+                all_y = None
+
+            if ymin is None or ymax is None:
+                continue
+            if not (np.isfinite(ymin) and np.isfinite(ymax)):
+                continue
+            if ymin == ymax:
+                ymin -= 1.0
+                ymax += 1.0
+            if not (ymin < ymax):
+                continue
+
+            try:
+                self.plot_widget.set_ylim(ai, ymin, ymax)
+                n_pts = len(all_y) if all_y is not None else 0
+                self.app.log(
+                    f'  [range] ось {ai + 1}: Y=[{ymin:.4g}, {ymax:.4g}], '
+                    f'точек={n_pts}')
+            except Exception as e:
+                self.app.log(f'  [range] ось {ai + 1} ОШИБКА: {e}')
+
+    def _recompute_ranges_for_axis(self, ai):
+        if ai >= len(self.plots_per_axes):
+            return
+        plots = self.plots_per_axes[ai]
+        ys = []
+        for p in plots:
+            if p.get('visible', True):
+                v = np.asarray(p['v'], dtype=float)
+                v = v[np.isfinite(v)]
+                if len(v):
+                    ys.append(v)
+        ymin, ymax = (self.y_limits[ai]
+                      if ai < len(self.y_limits) else (None, None))
+        if ys:
+            all_y = np.concatenate(ys)
+            if ymin is None:
+                ymin = float(all_y.min())
+            if ymax is None:
+                ymax = float(all_y.max())
+        if ymin is None or ymax is None:
+            return
+        if ymin == ymax:
+            ymin -= 1.0
+            ymax += 1.0
+        try:
+            self.plot_widget.set_ylim(ai, ymin, ymax)
+        except Exception:
+            pass
+
+    def _refresh_axis_combo(self):
+        n = len(self.plots_per_axes)
+        old = self.axis_combo.currentIndex()
+        self.axis_combo.blockSignals(True)
+        self.axis_combo.clear()
+        for k in range(n):
+            self.axis_combo.addItem(f'Ось {k + 1}')
+        if 0 <= old < n:
+            self.axis_combo.setCurrentIndex(old)
+        self.axis_combo.blockSignals(False)
+        self._on_axis_changed()
+
+    def _refresh_curve_combo(self):
+        old = self.curve_combo.currentData()
+        self.curve_combo.blockSignals(True)
+        self.curve_combo.clear()
+        idx = 0
+        sel = 0
+        for ai, plots in enumerate(self.plots_per_axes):
+            for j, p in enumerate(plots):
+                self.curve_combo.addItem(
+                    f'Ось {ai + 1}: {p["label"]}', (ai, j))
+                if old == (ai, j):
+                    sel = idx
+                idx += 1
+        if self.curve_combo.count() > 0:
+            self.curve_combo.setCurrentIndex(sel)
+        self.curve_combo.blockSignals(False)
+        self._on_curve_changed()
+
+    def _refresh_curves_tree(self):
+        if not hasattr(self, 'curves_tree'):
+            return
+        self.curves_tree.blockSignals(True)
+        self.curves_tree.clear()
+        for ai, plots in enumerate(self.plots_per_axes):
+            for j, p in enumerate(plots):
+                item = QTreeWidgetItem()
+                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                item.setCheckState(
+                    0, Qt.Checked if p.get('visible', True) else Qt.Unchecked)
+                item.setText(1, p.get('legend_label') or p['label'])
+                item.setText(2, f'Ось {ai + 1}')
+                item.setData(0, Qt.UserRole, (ai, j))
+                self.curves_tree.addTopLevelItem(item)
+        self.curves_tree.blockSignals(False)
+
+    def _on_curve_visibility_changed(self, item, column):
+        if column != 0:
+            return
+        data = item.data(0, Qt.UserRole)
+        if not data:
+            return
+        ai, j = data
+        if ai >= len(self.plots_per_axes) or j >= len(self.plots_per_axes[ai]):
+            return
+        p = self.plots_per_axes[ai][j]
+        visible = (item.checkState(0) == Qt.Checked)
+        p['visible'] = visible
+
+        curve = self._curve_objects.get((ai, j))
+        if curve is not None:
+            try:
+                curve.setVisible(visible)
+            except Exception:
+                pass
+
+        self._recompute_ranges_for_axis(ai)
+
+        self.app.log(
+            f'Кривая «{p["label"]}» (Ось {ai + 1}) '
+            f'{"показана" if visible else "скрыта"}.')
+
+    def _show_all_curves(self):
+        for plots in self.plots_per_axes:
+            for p in plots:
+                p['visible'] = True
+        for curve in self._curve_objects.values():
+            try:
+                curve.setVisible(True)
+            except Exception:
+                pass
+        self._refresh_curves_tree()
+        self._recompute_ranges()
+        self.app.log('Показаны все кривые.')
+
+    def _hide_all_curves(self):
+        for plots in self.plots_per_axes:
+            for p in plots:
+                p['visible'] = False
+        for curve in self._curve_objects.values():
+            try:
+                curve.setVisible(False)
+            except Exception:
+                pass
+        self._refresh_curves_tree()
+        self.app.log('Скрыты все кривые.')
+
+    def _on_axis_changed(self):
+        ai = self.axis_combo.currentIndex()
+        if ai < 0 or ai >= len(self.axis_labels):
+            self.axis_label_edit.clear()
+            return
+        self.axis_label_edit.setText(self.axis_labels[ai] or '')
+
+    def _on_curve_changed(self):
+        data = self.curve_combo.currentData()
+        if not data:
+            self.legend_edit.clear()
+            return
+        ai, j = data
+        if ai >= len(self.plots_per_axes) or j >= len(self.plots_per_axes[ai]):
+            return
+        p = self.plots_per_axes[ai][j]
+        self.legend_edit.setText(p.get('legend_label', ''))
+
+        c = p.get('color')
+        self._picked_color = c
+        if c is None:
+            self.color_btn.setText('Авто')
+            self.color_btn.setStyleSheet('')
+        else:
+            qc = rgb_to_qcolor(c)
+            self.color_btn.setText('Выбран')
+            self.color_btn.setStyleSheet(
+                f'background-color: {qc.name()}; color: '
+                f'{"black" if qc.lightness() > 128 else "white"};')
+
+        self.line_style_combo.setCurrentText(p.get('lineStyle', '-'))
+        self.line_width_combo.setCurrentText(
+            str(float(p.get('lineWidth', 1.5))))
+        self.marker_combo.setCurrentText(p.get('marker', 'none'))
+        self.marker_size_combo.setCurrentText(
+            str(int(float(p.get('markerSize', 6)))))
+
+    def apply_title(self):
+        txt = self.title_edit.text().strip()
+        self.custom_title = txt if txt else None
+        self.redraw()
+        self.app.log(f'Заголовок графика #{self.index} обновлён.')
+
+    def apply_axis_label(self):
+        ai = self.axis_combo.currentIndex()
+        if ai < 0 or ai >= len(self.axis_labels):
+            return
+        txt = self.axis_label_edit.text().strip()
+        self.axis_labels[ai] = txt if txt else None
+        self.redraw()
+        self.app.log(f'Подпись оси {ai + 1} графика #{self.index} обновлена.')
+
+    def apply_legend_label(self):
+        data = self.curve_combo.currentData()
+        if not data:
+            return
+        ai, j = data
+        if ai >= len(self.plots_per_axes) or j >= len(self.plots_per_axes[ai]):
+            return
+        txt = self.legend_edit.text().strip()
+        p = self.plots_per_axes[ai][j]
+        if txt:
+            p['legend_label'] = txt
+        else:
+            p.pop('legend_label', None)
+        self.redraw()
+        self.app.log(f'Подпись легенды обновлена: '
+                     f'Ось {ai + 1} / {p["label"]}.')
+
+    def pick_color(self):
+        init = self._picked_color
+        if init is None:
+            init = DEFAULT_COLOR
+        c = QColorDialog.getColor(
+            rgb_to_qcolor(init), self, 'Цвет линии')
+        if not c.isValid():
+            return
+        self._picked_color = (c.red() / 255.0, c.green() / 255.0,
+                              c.blue() / 255.0)
+        self.color_btn.setText('Выбран')
+        self.color_btn.setStyleSheet(
+            f'background-color: {c.name()}; color: '
+            f'{"black" if c.lightness() > 128 else "white"};')
+
+    def auto_color(self):
+        self._picked_color = None
+        self.color_btn.setText('Авто')
+        self.color_btn.setStyleSheet('')
+
+    def apply_style(self):
+        data = self.curve_combo.currentData()
+        if not data:
+            return
+        ai, j = data
+        if ai >= len(self.plots_per_axes) or j >= len(self.plots_per_axes[ai]):
+            return
+        p = self.plots_per_axes[ai][j]
+        p['color'] = self._picked_color
+        p['lineStyle'] = self.line_style_combo.currentText()
+        p['lineWidth'] = float(self.line_width_combo.currentText())
+        p['marker'] = self.marker_combo.currentText()
+        p['markerSize'] = float(self.marker_size_combo.currentText())
+        self.redraw()
+        self.app.log(f'Стиль применён: Ось {ai + 1} / {p["label"]}.')
+
+    def delete_current_curve(self):
+        data = self.curve_combo.currentData()
+        if not data:
+            return
+        ai, j = data
+        if ai >= len(self.plots_per_axes) or j >= len(self.plots_per_axes[ai]):
+            return
+        p = self.plots_per_axes[ai].pop(j)
+        if ai > 0 and not self.plots_per_axes[ai]:
+            self.plots_per_axes.pop(ai)
+            self.axes_colors.pop(ai)
+            self.y_limits.pop(ai)
+            if ai < len(self.axis_labels):
+                self.axis_labels.pop(ai)
+        self.redraw()
+        self.app.log(f'Кривая удалена: Ось {ai + 1} / {p["label"]}.')
+
+    def clear_plot(self):
+        self.plots_per_axes = [[]]
+        self.axes_colors = [None]
+        self.y_limits = [[None, None]]
+        self.x_limits = [None, None]
+        self.axis_labels = [None]
+        self.custom_title = None
+        self.redraw()
+        self.app.log(f'Все данные удалены с графика #{self.index}.')
+
+    def toggle_legend(self, state):
+        self.show_legend = (state == Qt.Checked)
+        self.plot_widget.set_legend_visible(self.show_legend)
+        self.app.log(
+            f'Легенда {"включена" if self.show_legend else "выключена"} '
+            f'на графике #{self.index}.')
+
+
+# ---------------------------------------------------------------------------
+# Разбор TRC в фоновом потоке
+# ---------------------------------------------------------------------------
+class TRCWorker(QThread):
+    log_signal = pyqtSignal(str)
+    progress_signal = pyqtSignal(int)
+    done_signal = pyqtSignal(list)
+    error_signal = pyqtSignal(str)
+
+    def __init__(self, filename):
+        super().__init__()
+        self.filename = filename
+
+    def run(self):
+        try:
+            msgs = parse_can_log(
+                self.filename,
+                progress_cb=self.log_signal.emit,
+                progress_value_cb=lambda v: self.progress_signal.emit(
+                    min(100, max(0, int(v)))),
+            )
+            self.done_signal.emit(msgs)
+        except Exception as e:
+            self.error_signal.emit(str(e))
+
+
+# ---------------------------------------------------------------------------
+# Главное окно
+# ---------------------------------------------------------------------------
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle('TRC Signal Plotter — PyQtGraph')
+        self.resize(1400, 1000)
+
+        self.trc_file = ''
+        self.messages = []
+        self.id_map = {}
+        self.id_count_map = {}
+        self.dbc = None
+        self.fig_counter = 0
+        self.plot_windows = []
+        self.custom_axis_color = None
+        self.plot_background_color = None
+        self.export_entries = []
+        self._trc_worker = None
+
+        self.prefs = load_prefs()
+        self.last_trc_dir = self.prefs.get('lastTrcDir', os.getcwd())
+        self.last_dbc_dir = self.prefs.get('lastDbcDir', os.getcwd())
+        self.last_export_dir = self.prefs.get('lastExportDir', os.getcwd())
+
+        self._build_ui()
+        self.log('Приложение готово.')
+        self.log('Шаг 1: выберите .trc файл → «Читать TRC».')
+        self.log('Шаг 2: выберите .dbc файл.')
+        self.log('Шаг 3: выберите сообщение/сигналы → «Построить график».')
+        self.log('В окне графика можно редактировать заголовок, '
+                 'подписи осей, легенду и видимость кривых.')
+        if not HAS_SCIPY:
+            self.log('Внимание: scipy не установлен — экспорт .mat недоступен.')
+
+    def _build_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(6, 6, 6, 6)
+        root.setSpacing(4)
+
+        top = QGridLayout()
+        top.setColumnStretch(1, 1)
+
+        top.addWidget(QLabel('TRC файл:'), 0, 0)
+        self.trc_entry = QLineEdit()
+        self.trc_entry.setReadOnly(True)
+        self.trc_entry.setText('(не выбран)')
+        top.addWidget(self.trc_entry, 0, 1)
+        b = QPushButton('Обзор...')
+        b.clicked.connect(self.on_browse_trc)
+        top.addWidget(b, 0, 2)
+        self.read_trc_btn = QPushButton('Читать TRC')
+        self.read_trc_btn.setEnabled(False)
+        self.read_trc_btn.clicked.connect(self.on_read_trc)
+        top.addWidget(self.read_trc_btn, 0, 3)
+
+        top.addWidget(QLabel('DBC файл:'), 1, 0)
+        self.dbc_entry = QLineEdit()
+        self.dbc_entry.setReadOnly(True)
+        self.dbc_entry.setText('(не выбран)')
+        top.addWidget(self.dbc_entry, 1, 1)
+        b = QPushButton('Обзор...')
+        b.clicked.connect(self.on_browse_dbc)
+        top.addWidget(b, 1, 2)
+
+        top.addWidget(QLabel('Прогресс чтения:'), 2, 0)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        top.addWidget(self.progress_bar, 2, 1, 1, 3)
+
+        root.addLayout(top)
+
+        splitter = QSplitter(Qt.Horizontal)
+        root.addWidget(splitter, stretch=1)
+
+        left = QSplitter(Qt.Vertical)
+
+        msg_box = QWidget()
+        mb = QVBoxLayout(msg_box)
+        mb.setContentsMargins(0, 0, 0, 0)
+        mb.addWidget(QLabel('Сообщения DBC (двойной клик по шапке — сортировка):'))
+        self.msg_tree = QTreeWidget()
+        self.msg_tree.setHeaderLabels(['ID', 'Name', 'Count'])
+        self.msg_tree.setRootIsDecorated(False)
+        self.msg_tree.setAlternatingRowColors(True)
+        self.msg_tree.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.msg_tree.header().sectionClicked.connect(self._sort_msg_tree)
+        self.msg_tree.itemSelectionChanged.connect(self.on_msg_select)
+        mb.addWidget(self.msg_tree)
+        left.addWidget(msg_box)
+
+        sig_box = QWidget()
+        sb = QVBoxLayout(sig_box)
+        sb.setContentsMargins(0, 0, 0, 0)
+        sb.addWidget(QLabel('Сигналы (Ctrl+клик — несколько):'))
+        self.sig_tree = QTreeWidget()
+        self.sig_tree.setHeaderLabels(['Signal', 'Unit'])
+        self.sig_tree.setRootIsDecorated(False)
+        self.sig_tree.setAlternatingRowColors(True)
+        self.sig_tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        sb.addWidget(self.sig_tree)
+        left.addWidget(sig_box)
+
+        splitter.addWidget(left)
+
+        self.tabs = QTabWidget()
+        self.tab_plot = QWidget()
+        self.tab_export = QWidget()
+        self.tabs.addTab(self.tab_plot, 'Построение графика')
+        self.tabs.addTab(self.tab_export, 'Экспорт')
+        self._build_plot_tab(self.tab_plot)
+        self._build_export_tab(self.tab_export)
+        splitter.addWidget(self.tabs)
+
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 2)
+
+        log_box = QGroupBox('Журнал')
+        lb = QVBoxLayout(log_box)
+        lb.setContentsMargins(4, 4, 4, 4)
+        self.log_text = QPlainTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setMaximumBlockCount(2000)
+        self.log_text.setFont(QFont('Consolas', 9))
+        lb.addWidget(self.log_text)
+        root.addWidget(log_box)
+
+    def _build_plot_tab(self, parent):
+        layout = QVBoxLayout(parent)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(6)
+
+        build_box = QGroupBox('Построение')
+        bb = QVBoxLayout(build_box)
+
+        self.plot_btn = QPushButton('Построить график')
+        self.plot_btn.setStyleSheet('font-weight: bold; padding: 6px;')
+        self.plot_btn.clicked.connect(self.on_plot)
+        bb.addWidget(self.plot_btn)
+
+        self.add_mode_cb = QCheckBox('Добавить к выбранному графику')
+        bb.addWidget(self.add_mode_cb)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel('Ось:'))
+        self.add_coords_combo = QComboBox()
+        self.add_coords_combo.addItem('Ось 1')
+        row.addWidget(self.add_coords_combo, stretch=1)
+        bb.addLayout(row)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel('Окно для добавления:'))
+        self.target_combo = QComboBox()
+        self.target_combo.currentIndexChanged.connect(self.on_target_changed)
+        row.addWidget(self.target_combo, stretch=1)
+        bb.addLayout(row)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel('Цвет новой оси:'))
+        self.color_btn = QPushButton('Авто')
+        self.color_btn.clicked.connect(self.on_pick_axis_color)
+        row.addWidget(self.color_btn, stretch=1)
+        b = QPushButton('Сброс')
+        b.clicked.connect(self.on_reset_axis_color)
+        row.addWidget(b)
+        bb.addLayout(row)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel('Фон графика:'))
+        self.bg_btn = QPushButton('Авто')
+        self.bg_btn.clicked.connect(self.on_pick_plot_background)
+        row.addWidget(self.bg_btn, stretch=1)
+        b = QPushButton('Сброс')
+        b.clicked.connect(self.on_reset_plot_background)
+        row.addWidget(b)
+        bb.addLayout(row)
+
+        hint = QLabel('Масштабирование мышью: ЛКМ-протяжка = область; '
+                      'Shift+ЛКМ = только по X; Ctrl+ЛКМ = только по Y; '
+                      'ПКМ = панорамирование')
+        hint.setStyleSheet('color: #777; font-size: 11px;')
+        hint.setWordWrap(True)
+        bb.addWidget(hint)
+
+        layout.addWidget(build_box)
+
+        lim_box = QGroupBox('Пределы осей координат')
+        lb = QGridLayout(lim_box)
+
+        lb.addWidget(QLabel('Ось (Y):'), 0, 0)
+        self.limit_axis_combo = QComboBox()
+        self.limit_axis_combo.addItem('Ось 1')
+        self.limit_axis_combo.currentIndexChanged.connect(
+            self.sync_limit_edits)
+        lb.addWidget(self.limit_axis_combo, 0, 1, 1, 3)
+
+        lb.addWidget(QLabel('Y min:'), 1, 0)
+        self.y_min_edit = QLineEdit()
+        lb.addWidget(self.y_min_edit, 1, 1)
+        lb.addWidget(QLabel('Y max:'), 1, 2)
+        self.y_max_edit = QLineEdit()
+        lb.addWidget(self.y_max_edit, 1, 3)
+
+        lb.addWidget(QLabel('X min:'), 2, 0)
+        self.x_min_edit = QLineEdit()
+        lb.addWidget(self.x_min_edit, 2, 1)
+        lb.addWidget(QLabel('X max:'), 2, 2)
+        self.x_max_edit = QLineEdit()
+        lb.addWidget(self.x_max_edit, 2, 3)
+
+        lb.addWidget(QLabel('(пусто = авто; X общий для всех осей)'),
+                     3, 0, 1, 4)
+
+        row = QHBoxLayout()
+        b = QPushButton('Применить')
+        b.clicked.connect(self.on_apply_limits)
+        row.addWidget(b)
+        b = QPushButton('Авто')
+        b.clicked.connect(self.on_auto_limits)
+        row.addWidget(b)
+        lb.addLayout(row, 4, 0, 1, 4)
+
+        layout.addWidget(lim_box)
+
+        svc_box = QGroupBox('Сервис')
+        sb = QVBoxLayout(svc_box)
+
+        b = QPushButton('Очистить выбор сигналов')
+        b.clicked.connect(self.sig_tree.clearSelection)
+        sb.addWidget(b)
+
+        b = QPushButton('Закрыть все графики')
+        b.clicked.connect(self.on_close_all_plots)
+        sb.addWidget(b)
+
+        b = QPushButton('Сбросить пути')
+        b.clicked.connect(self.on_reset_paths)
+        sb.addWidget(b)
+
+        b = QPushButton('Очистить журнал')
+        b.clicked.connect(self._clear_log)
+        sb.addWidget(b)
+
+        layout.addWidget(svc_box)
+        layout.addStretch()
+
+    def _build_export_tab(self, parent):
+        layout = QVBoxLayout(parent)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(6)
+
+        b = QPushButton('→  Добавить выбранные сигналы в список экспорта')
+        b.setStyleSheet('font-weight: bold; padding: 6px;')
+        b.clicked.connect(self._add_signals_to_export)
+        layout.addWidget(b)
+
+        lbl = QLabel('(выберите сигналы в левом дереве, затем нажмите кнопку)')
+        lbl.setStyleSheet('color: #777;')
+        layout.addWidget(lbl)
+
+        self.export_tree = QTreeWidget()
+        self.export_tree.setHeaderLabels(['Message', 'Signal', 'Unit'])
+        self.export_tree.setRootIsDecorated(False)
+        self.export_tree.setAlternatingRowColors(True)
+        self.export_tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        layout.addWidget(self.export_tree, stretch=1)
+
+        row = QHBoxLayout()
+        self.export_count_label = QLabel('Сигналов в списке: 0')
+        self.export_count_label.setStyleSheet('font-weight: bold;')
+        row.addWidget(self.export_count_label)
+        row.addStretch()
+        b = QPushButton('← Удалить выбранные')
+        b.clicked.connect(self._remove_from_export)
+        row.addWidget(b)
+        b = QPushButton('Очистить список')
+        b.clicked.connect(self._clear_export_list)
+        row.addWidget(b)
+        layout.addLayout(row)
+
+        settings = QGroupBox('Настройки экспорта')
+        form = QFormLayout(settings)
+
+        self.export_fmt = QComboBox()
+        self.export_fmt.addItems([
+            'CSV files (folder)',
+            'NPZ (single file)',
+            'MAT file (folder)',
+        ])
+        self.export_fmt.currentIndexChanged.connect(
+            self._on_export_fmt_changed)
+        form.addRow('Формат:', self.export_fmt)
+
+        self.mat_type_combo = QComboBox()
+        self.mat_type_combo.addItems(['double', 'timeseries'])
+        form.addRow('Тип (MAT):', self.mat_type_combo)
+
+        self.export_prefix = QLineEdit()
+        form.addRow('Префикс:', self.export_prefix)
+
+        self.mat_filename_edit = QLineEdit('signals')
+        form.addRow('Имя .mat:', self.mat_filename_edit)
+
+        layout.addWidget(settings)
+
+        b = QPushButton('ЭКСПОРТИРОВАТЬ')
+        b.setStyleSheet('font-weight: bold; padding: 8px;')
+        b.clicked.connect(self.on_export)
+        layout.addWidget(b)
+
+        self._on_export_fmt_changed()
+
+    def _on_export_fmt_changed(self):
+        is_mat = self.export_fmt.currentText().startswith('MAT')
+        self.mat_filename_edit.setEnabled(is_mat)
+        self.mat_type_combo.setEnabled(is_mat)
+
+    def log(self, msg):
+        self.log_text.appendPlainText(msg)
+
+    def _clear_log(self):
+        if getattr(self, 'log_text', None) is not None:
+            self.log_text.clear()
+
+    def on_browse_trc(self):
+        start = self.last_trc_dir if os.path.isdir(self.last_trc_dir) else ''
+        path, _ = QFileDialog.getOpenFileName(
+            self, 'Выберите .trc файл', start,
+            'TRC files (*.trc);;All files (*)')
+        if not path:
+            return
+        self.last_trc_dir = os.path.dirname(path)
+        self.prefs['lastTrcDir'] = self.last_trc_dir
+        save_prefs(self.prefs)
+
+        self.trc_file = path
+        self.trc_entry.setText(path)
+        self.messages = []
+        self.id_map = {}
+        self.id_count_map = {}
+        self.read_trc_btn.setEnabled(True)
+        self.progress_bar.setValue(0)
+        self.refresh_message_list()
+        self.log(f'Выбран TRC: {path}')
+
+    def on_read_trc(self):
+        if not self.trc_file or not os.path.isfile(self.trc_file):
+            self.log('TRC файл не выбран или не найден.')
+            return
+        self.log(f'Загрузка TRC: {self.trc_file} ...')
+        self.read_trc_btn.setEnabled(False)
+        self.progress_bar.setValue(0)
+
+        self._trc_worker = TRCWorker(self.trc_file)
+        self._trc_worker.log_signal.connect(self.log)
+        self._trc_worker.progress_signal.connect(self.progress_bar.setValue)
+        self._trc_worker.done_signal.connect(self._on_trc_done)
+        self._trc_worker.error_signal.connect(self._on_trc_error)
+        self._trc_worker.start()
+
+    def _on_trc_done(self, msgs):
+        self.read_trc_btn.setEnabled(True)
+        self.messages = msgs
+        n = len(self.messages)
+        if n == 0:
+            self.log('TRC разобран, но сообщений не найдено.')
+            return
+        self.log(f'TRC разобран: {n} сообщений.')
+
+        groups = defaultdict(list)
+        for k, msg in enumerate(self.messages):
+            groups[msg['id_val']].append(k)
+        self.id_map = dict(groups)
+        self.id_count_map = {k: len(v) for k, v in groups.items()}
+        self.log(f'Уникальных ID: {len(self.id_map)}.')
+        self.refresh_message_list()
+
+    def _on_trc_error(self, msg):
+        self.read_trc_btn.setEnabled(True)
+        self.progress_bar.setValue(0)
+        self.log(f'Ошибка при разборе TRC: {msg}')
+        self.messages = []
+        self.id_map = {}
+        self.id_count_map = {}
+        self.refresh_message_list()
+
+    def on_browse_dbc(self):
+        start = self.last_dbc_dir if os.path.isdir(self.last_dbc_dir) else ''
+        path, _ = QFileDialog.getOpenFileName(
+            self, 'Выберите .dbc файл', start,
+            'DBC files (*.dbc);;All files (*)')
+        if not path:
+            return
+        self.last_dbc_dir = os.path.dirname(path)
+        self.prefs['lastDbcDir'] = self.last_dbc_dir
+        save_prefs(self.prefs)
+
+        self.dbc_entry.setText(path)
+        self.log(f'Загрузка DBC: {path} ...')
+
+        self.export_entries = []
+        self._refresh_export_list()
+
+        try:
+            self.dbc = parse_dbc(path)
+        except Exception as e:
+            self.log(f'Ошибка при разборе DBC: {e}')
+            self.dbc = None
+            self.msg_tree.clear()
+            self.sig_tree.clear()
+            return
+        self.log(f'DBC разобран: {len(self.dbc["messages"])} сообщений.')
+        self.refresh_message_list()
+
+    def refresh_message_list(self):
+        self.msg_tree.clear()
+        if self.dbc is None:
+            self.sig_tree.clear()
+            return
+        have_table = bool(self.id_count_map)
+        for i, m in enumerate(self.dbc['messages']):
+            cnt = self.id_count_map.get(m['id'], 0) if have_table else 0
+            item = QTreeWidgetItem([
+                f"0x{m['id']:08X}", m['name'],
+                str(cnt) if have_table else '-',
+            ])
+            item.setData(0, Qt.UserRole, i)
+            self.msg_tree.addTopLevelItem(item)
+        if self.msg_tree.topLevelItemCount() > 0:
+            self.msg_tree.setCurrentItem(self.msg_tree.topLevelItem(0))
+            self.on_msg_select()
+
+    def _sort_msg_tree(self, col):
+        if self.dbc is None or self.msg_tree.topLevelItemCount() == 0:
+            return
+        items = []
+        for i in range(self.msg_tree.topLevelItemCount()):
+            it = self.msg_tree.topLevelItem(i)
+            items.append((it, [it.text(0), it.text(1), it.text(2)]))
+        if col == 2:
+            keyf = lambda x: (int(x[1][2])
+                              if x[1][2].lstrip('-').isdigit() else 0)
+        else:
+            keyf = lambda x: x[1][col]
+        items.sort(key=keyf)
+        self.msg_tree.clear()
+        for it, _ in items:
+            self.msg_tree.addTopLevelItem(it)
+
+    def on_msg_select(self):
+        self.sig_tree.clear()
+        if self.dbc is None:
+            return
+        item = self.msg_tree.currentItem()
+        if item is None:
+            return
+        m_idx = item.data(0, Qt.UserRole)
+        if m_idx is None or m_idx >= len(self.dbc['messages']):
+            return
+        sigs = self.dbc['messages'][m_idx]['signals']
+        for si, s in enumerate(sigs):
+            it = QTreeWidgetItem([s['name'], s['unit'] or ''])
+            it.setData(0, Qt.UserRole, si)
+            self.sig_tree.addTopLevelItem(it)
+
+    def on_pick_axis_color(self):
+        init = self.custom_axis_color or DEFAULT_COLOR
+        c = QColorDialog.getColor(
+            rgb_to_qcolor(init), self, 'Цвет новой оси')
+        if not c.isValid():
+            return
+        self.custom_axis_color = (c.red() / 255.0, c.green() / 255.0,
+                                  c.blue() / 255.0)
+        self.color_btn.setText('Выбран')
+        self.color_btn.setStyleSheet(
+            f'background-color: {c.name()}; color: '
+            f'{"black" if c.lightness() > 128 else "white"};')
+        self.log('Цвет новой оси обновлён.')
+
+    def on_reset_axis_color(self):
+        self.custom_axis_color = None
+        self.color_btn.setText('Авто')
+        self.color_btn.setStyleSheet('')
+        self.log('Цвет новой оси: авто.')
+
+    def on_pick_plot_background(self):
+        init = self.plot_background_color or QColor('#ffffff')
+        c = QColorDialog.getColor(init, self, 'Фон графика')
+        if not c.isValid():
+            return
+        self.plot_background_color = c
+        self.bg_btn.setText('Выбран')
+        self.bg_btn.setStyleSheet(
+            f'background-color: {c.name()}; color: '
+            f'{"black" if c.lightness() > 128 else "white"};')
+        self._apply_background_to_all(c)
+        self.log(f'Фон графика: {c.name()}.')
+
+    def on_reset_plot_background(self):
+        self.plot_background_color = None
+        self.bg_btn.setText('Авто')
+        self.bg_btn.setStyleSheet('')
+        self._apply_background_to_all(None)
+        self.log('Фон графика: авто (белый).')
+
+    def _apply_background_to_all(self, qcolor):
+        for pw in self.plot_windows:
+            try:
+                pw.set_background(qcolor)
+            except Exception:
+                pass
+
+    def on_plot_window_closed(self, pw):
+        if pw in self.plot_windows:
+            self.plot_windows.remove(pw)
+        try:
+            pw.deleteLater()
+        except Exception:
+            pass
+        self.refresh_target_list()
+        self.log('Окно графика закрыто.')
+
+    def refresh_target_list(self):
+        old = self.target_combo.currentIndex()
+        self.target_combo.blockSignals(True)
+        self.target_combo.clear()
+        if not self.plot_windows:
+            self.target_combo.addItem('(нет открытых графиков)')
+        else:
+            for pw in self.plot_windows:
+                self.target_combo.addItem(
+                    f'График #{pw.index} — {pw.window_title}')
+            if 0 <= old < len(self.plot_windows):
+                self.target_combo.setCurrentIndex(old)
+        self.target_combo.blockSignals(False)
+        self.refresh_coord_list()
+        self.refresh_limit_axis_list()
+
+    def on_target_changed(self):
+        self.refresh_coord_list()
+        self.refresh_limit_axis_list()
+        self.sync_limit_edits()
+
+    def get_current_plot_window(self):
+        if not self.plot_windows:
+            return None
+        idx = self.target_combo.currentIndex()
+        if idx < 0 or idx >= len(self.plot_windows):
+            return None
+        return self.plot_windows[idx]
+
+    def refresh_coord_list(self):
+        pw = self.get_current_plot_window()
+        old = self.add_coords_combo.currentIndex()
+        self.add_coords_combo.blockSignals(True)
+        self.add_coords_combo.clear()
+        if pw is None:
+            self.add_coords_combo.addItem('Ось 1')
+            self.add_coords_combo.addItem('Новая ось')
+        else:
+            for k in range(len(pw.plots_per_axes)):
+                self.add_coords_combo.addItem(f'Ось {k + 1}')
+            self.add_coords_combo.addItem('Новая ось')
+            if 0 <= old < self.add_coords_combo.count():
+                self.add_coords_combo.setCurrentIndex(old)
+        self.add_coords_combo.blockSignals(False)
+
+    def refresh_limit_axis_list(self):
+        pw = self.get_current_plot_window()
+        old = self.limit_axis_combo.currentIndex()
+        self.limit_axis_combo.blockSignals(True)
+        self.limit_axis_combo.clear()
+        if pw is None:
+            self.limit_axis_combo.addItem('Ось 1')
+        else:
+            for k in range(len(pw.plots_per_axes)):
+                self.limit_axis_combo.addItem(f'Ось {k + 1}')
+            if 0 <= old < self.limit_axis_combo.count():
+                self.limit_axis_combo.setCurrentIndex(old)
+        self.limit_axis_combo.blockSignals(False)
+        self.sync_limit_edits()
+
+    def sync_limit_edits(self):
+        pw = self.get_current_plot_window()
+        for e in (self.y_min_edit, self.y_max_edit,
+                  self.x_min_edit, self.x_max_edit):
+            e.clear()
+        if pw is None:
+            return
+        ai = self.limit_axis_combo.currentIndex()
+        if ai < 0 or ai >= len(pw.plots_per_axes):
+            return
+        ymin, ymax = pw.y_limits[ai]
+        xmin, xmax = pw.x_limits
+        if ymin is not None:
+            self.y_min_edit.setText(str(ymin))
+        if ymax is not None:
+            self.y_max_edit.setText(str(ymax))
+        if xmin is not None:
+            self.x_min_edit.setText(str(xmin))
+        if xmax is not None:
+            self.x_max_edit.setText(str(xmax))
+
+    def on_close_all_plots(self):
+        n = len(self.plot_windows)
+        for pw in list(self.plot_windows):
+            try:
+                pw.close()
+            except Exception:
+                pass
+        self.plot_windows = []
+        self.fig_counter = 0
+        self.refresh_target_list()
+        self.log(f'Закрыто графиков: {n}')
+
+    @staticmethod
+    def _parse_limit(s):
+        s = s.strip()
+        if not s:
+            return None, True
+        try:
+            return float(s.replace(',', '.')), True
+        except ValueError:
+            return None, False
+
+    def on_apply_limits(self):
+        pw = self.get_current_plot_window()
+        if pw is None:
+            self.log('Нет выбранного графика.')
+            return
+        ai = self.limit_axis_combo.currentIndex()
+        if ai < 0 or ai >= len(pw.plots_per_axes):
+            self.log('Выберите корректную ось.')
+            return
+
+        ymn, ok1 = self._parse_limit(self.y_min_edit.text())
+        ymx, ok2 = self._parse_limit(self.y_max_edit.text())
+        xmn, ok3 = self._parse_limit(self.x_min_edit.text())
+        xmx, ok4 = self._parse_limit(self.x_max_edit.text())
+        if not (ok1 and ok2 and ok3 and ok4):
+            self.log('Ошибка: некорректное число в поле предела.')
+            return
+        if ymn is not None and ymx is not None and ymn >= ymx:
+            self.log('Y min должно быть меньше Y max.')
+            return
+        if xmn is not None and xmx is not None and xmn >= xmx:
+            self.log('X min должно быть меньше X max.')
+            return
+
+        pw.y_limits[ai] = [ymn, ymx]
+        pw.x_limits = [xmn, xmx]
+        pw.redraw()
+        self.log(f'Пределы графика #{pw.index} — ось №{ai + 1} применены.')
+
+    def on_auto_limits(self):
+        pw = self.get_current_plot_window()
+        if pw is None:
+            return
+        ai = self.limit_axis_combo.currentIndex()
+        if ai < 0 or ai >= len(pw.plots_per_axes):
+            return
+        pw.y_limits[ai] = [None, None]
+        pw.x_limits = [None, None]
+        pw.redraw()
+        self.sync_limit_edits()
+        self.log(f'Пределы графика #{pw.index} — ось №{ai + 1} сброшены.')
+
+    def on_plot(self):
+        if not self.messages:
+            self.log('Сначала нажмите «Читать TRC».')
+            return
+        if self.dbc is None:
+            self.log('Сначала загрузите DBC файл.')
+            return
+        item = self.msg_tree.currentItem()
+        if item is None:
+            self.log('Выберите сообщение.')
+            return
+        m_idx = item.data(0, Qt.UserRole)
+        if m_idx is None or m_idx >= len(self.dbc['messages']):
+            return
+        msg_def = self.dbc['messages'][m_idx]
+
+        s_sel = []
+        for it in self.sig_tree.selectedItems():
+            si = it.data(0, Qt.UserRole)
+            if si is not None and 0 <= si < len(msg_def['signals']):
+                s_sel.append(si)
+        if not s_sel:
+            self.log('Выберите хотя бы один сигнал.')
+            return
+
+        match_idx = self.id_map.get(msg_def['id'], [])
+        if not match_idx:
+            self.log(f'В TRC не найдено сообщений с ID '
+                     f'0x{msg_def["id"]:08X}.')
+            return
+
+        new_plots = []
+        for si in s_sel:
+            sig = msg_def['signals'][si]
+            n = len(match_idx)
+            t_arr = np.zeros(n)
+            v_arr = np.zeros(n)
+            for k, mi in enumerate(match_idx):
+                m = self.messages[mi]
+                data = m['data']
+                if sig['byteorder'] == '1':
+                    v = extract_intel(data, sig['start'], sig['len'],
+                                      sig['sign'] == '-',
+                                      sig['scale'], sig['offset'])
+                else:
+                    v = extract_motorola(data, sig['start'], sig['len'],
+                                         sig['sign'] == '-',
+                                         sig['scale'], sig['offset'])
+                t_arr[k] = m['time']
+                v_arr[k] = v
+            label = sig['name']
+            if sig['unit']:
+                label = f"{sig['name']} [{sig['unit']}]"
+
+            # Диагностика данных
+            vv = np.asarray(v_arr, dtype=float)
+            vv = vv[np.isfinite(vv)]
+            if len(vv):
+                self.log(
+                    f'  Сигнал «{sig["name"]}»: n={len(v_arr)}, '
+                    f'min={vv.min():.4g}, max={vv.max():.4g}, '
+                    f'mean={vv.mean():.4g}')
+
+            new_plots.append({
+                't': t_arr, 'v': v_arr, 'label': label,
+                'msgName': msg_def['name'],
+                'color': None, 'lineStyle': '-', 'lineWidth': 1.5,
+                'marker': 'none', 'markerSize': 6,
+                'visible': True,
+            })
+
+        add_mode = self.add_mode_cb.isChecked()
+        target = self.get_current_plot_window() if add_mode else None
+
+        if target is not None:
+            coord_choice = self.add_coords_combo.currentIndex()
+            n_axes = len(target.plots_per_axes)
+            if coord_choice < 0 or coord_choice > n_axes:
+                coord_choice = n_axes
+            target.add_plots(new_plots, coord_choice, self.custom_axis_color)
+            if coord_choice >= n_axes:
+                self.log(f'Добавлено {len(new_plots)} сигнал(ов) в новую ось '
+                         f'№{n_axes + 1} графика #{target.index}.')
+            else:
+                self.log(f'Добавлено {len(new_plots)} сигнал(ов) в ось '
+                         f'№{coord_choice + 1} графика #{target.index}.')
+            self.refresh_coord_list()
+            self.refresh_limit_axis_list()
+        else:
+            self.fig_counter += 1
+            title = f"График #{self.fig_counter} — {msg_def['name']}"
+            pw = PlotWindow(self, self.fig_counter, title,
+                            background_color=self.plot_background_color)
+            pw.plots_per_axes = [new_plots]
+            pw.axes_colors = [self.custom_axis_color]
+            pw.y_limits = [[None, None]]
+            pw.axis_labels = [None]
+            pw.closed.connect(self.on_plot_window_closed)
+            pw.state_changed.connect(self.refresh_target_list)
+            self.plot_windows.append(pw)
+            pw.show()
+            pw.redraw()
+            self.refresh_target_list()
+            self.log(f'Открыт {title}: {len(new_plots)} сигнал(ов) '
+                     f'по {len(match_idx)} сообщениям.')
+
+    def on_reset_paths(self):
+        self.last_trc_dir = os.getcwd()
+        self.last_dbc_dir = os.getcwd()
+        self.last_export_dir = os.getcwd()
+        self.prefs.pop('lastTrcDir', None)
+        self.prefs.pop('lastDbcDir', None)
+        self.prefs.pop('lastExportDir', None)
+        save_prefs(self.prefs)
+        self.log('Сохранённые пути сброшены.')
+
+    def _add_signals_to_export(self):
+        if self.dbc is None:
+            self.log('Сначала загрузите DBC.')
+            return
+        item = self.msg_tree.currentItem()
+        if item is None:
+            self.log('Выберите сообщение.')
+            return
+        m_idx = item.data(0, Qt.UserRole)
+        if m_idx is None or m_idx >= len(self.dbc['messages']):
+            return
+        msg_def = self.dbc['messages'][m_idx]
+
+        s_sel = []
+        for it in self.sig_tree.selectedItems():
+            si = it.data(0, Qt.UserRole)
+            if si is not None and 0 <= si < len(msg_def['signals']):
+                s_sel.append(si)
+        if not s_sel:
+            self.log('Выберите сигналы.')
+            return
+
+        existing = {(e['msg_idx'], e['sig_idx']) for e in self.export_entries}
+        added = 0
+        for si in s_sel:
+            key = (m_idx, si)
+            if key in existing:
+                continue
+            sig = msg_def['signals'][si]
+            self.export_entries.append({
+                'msg_idx': m_idx, 'sig_idx': si,
+                'msg_name': msg_def['name'], 'msg_id': msg_def['id'],
+                'sig_name': sig['name'], 'unit': sig['unit'],
+            })
+            added += 1
+            existing.add(key)
+        self._refresh_export_list()
+        self.log(f'Добавлено в экспорт: {added}.')
+
+    def _remove_from_export(self):
+        sel_items = self.export_tree.selectedItems()
+        if not sel_items:
+            return
+        to_remove = set()
+        for it in sel_items:
+            idx = it.data(0, Qt.UserRole)
+            if idx is not None:
+                to_remove.add(idx)
+        self.export_entries = [e for i, e in enumerate(self.export_entries)
+                               if i not in to_remove]
+        self._refresh_export_list()
+        self.log(f'Удалено из экспорта: {len(to_remove)}.')
+
+    def _clear_export_list(self):
+        n = len(self.export_entries)
+        self.export_entries = []
+        self._refresh_export_list()
+        self.log(f'Список экспорта очищен ({n}).')
+
+    def _refresh_export_list(self):
+        self.export_tree.clear()
+        for i, e in enumerate(self.export_entries):
+            it = QTreeWidgetItem([e['msg_name'], e['sig_name'],
+                                  e['unit'] or ''])
+            it.setData(0, Qt.UserRole, i)
+            self.export_tree.addTopLevelItem(it)
+        self.export_count_label.setText(
+            f'Сигналов в списке: {len(self.export_entries)}')
+
+    def _collect_signals(self, entries, prefix):
+        if self.dbc is None:
+            return {}
+        out = {}
+        for e in entries:
+            m_idx = e['msg_idx']
+            si = e['sig_idx']
+            if m_idx >= len(self.dbc['messages']):
+                continue
+            msg_def = self.dbc['messages'][m_idx]
+            if si >= len(msg_def['signals']):
+                continue
+            sig = msg_def['signals'][si]
+            match_idx = self.id_map.get(msg_def['id'], [])
+            if not match_idx:
+                self.log(f'  ! Нет данных: {msg_def["name"]}.{sig["name"]}')
+                continue
+            n = len(match_idx)
+            t_arr = np.zeros(n)
+            v_arr = np.zeros(n)
+            for k, mi in enumerate(match_idx):
+                m = self.messages[mi]
+                data = m['data']
+                if sig['byteorder'] == '1':
+                    v = extract_intel(data, sig['start'], sig['len'],
+                                      sig['sign'] == '-',
+                                      sig['scale'], sig['offset'])
+                else:
+                    v = extract_motorola(data, sig['start'], sig['len'],
+                                         sig['sign'] == '-',
+                                         sig['scale'], sig['offset'])
+                t_arr[k] = m['time']
+                v_arr[k] = v
+            name = sig['name']
+            if prefix:
+                name = f'{prefix}_{name}'
+            var_name = sanitize_var_name(name)
+            if var_name in out:
+                var_name = sanitize_var_name(f'{var_name}_{msg_def["name"]}')
+            out[var_name] = {
+                'name': sig['name'], 'unit': sig['unit'],
+                't': t_arr, 'v': v_arr,
+            }
+        return out
+
+    def _initial_export_dir(self):
+        d = self.last_export_dir
+        return d if os.path.isdir(d) else os.getcwd()
+
+    def on_export(self):
+        if not self.messages:
+            self.log('Сначала нажмите «Читать TRC».')
+            return
+        if self.dbc is None:
+            self.log('Сначала загрузите DBC.')
+            return
+        if not self.export_entries:
+            self.log('Список экспорта пуст.')
+            return
+        prefix = self.export_prefix.text().strip()
+        data_out = self._collect_signals(self.export_entries, prefix)
+        if not data_out:
+            self.log('Нечего экспортировать.')
+            return
+        fmt = self.export_fmt.currentText()
+        if fmt.startswith('CSV'):
+            self._export_csv(data_out)
+        elif fmt.startswith('NPZ'):
+            self._export_npz(data_out)
+        elif fmt.startswith('MAT'):
+            self._export_mat(data_out)
+
+    def _export_csv(self, data_out):
+        folder = QFileDialog.getExistingDirectory(
+            self, 'Папка для CSV', self._initial_export_dir())
+        if not folder:
+            return
+        self.last_export_dir = folder
+        self.prefs['lastExportDir'] = folder
+        save_prefs(self.prefs)
+        for var, d in data_out.items():
+            path = os.path.join(folder, f'{var}.csv')
+            arr = np.column_stack([d['t'], d['v']])
+            try:
+                np.savetxt(path, arr, delimiter=',',
+                           header='time,value', comments='', fmt='%.9g')
+                self.log(f'  • {var}.csv ({len(d["t"])} точек)')
+            except OSError as e:
+                self.log(f'  ! Ошибка: {e}')
+        QMessageBox.information(self, 'Готово',
+                                f'CSV сохранено: {len(data_out)}')
+
+    def _export_npz(self, data_out):
+        path, _ = QFileDialog.getSaveFileName(
+            self, 'Сохранить NPZ', self._initial_export_dir(),
+            'NumPy archive (*.npz)')
+        if not path:
+            return
+        if not path.lower().endswith('.npz'):
+            path += '.npz'
+        self.last_export_dir = os.path.dirname(path)
+        self.prefs['lastExportDir'] = self.last_export_dir
+        save_prefs(self.prefs)
+        payload = {}
+        for var, d in data_out.items():
+            payload[var + '_time'] = d['t']
+            payload[var + '_value'] = d['v']
+            payload[var + '_name'] = d['name']
+            payload[var + '_unit'] = d['unit']
+        try:
+            np.savez(path, **payload)
+            self.log(f'Сохранено: {path}')
+            QMessageBox.information(self, 'Готово',
+                                    f'Экспортировано: {len(data_out)}')
+        except OSError as e:
+            self.log(f'Ошибка: {e}')
+
+    def _export_mat(self, data_out):
+        if not HAS_SCIPY:
+            QMessageBox.critical(self, 'Нет scipy',
+                                 'Установите: pip install scipy')
+            return
+        folder = QFileDialog.getExistingDirectory(
+            self, 'Папка для .mat', self._initial_export_dir())
+        if not folder:
+            return
+        self.last_export_dir = folder
+        self.prefs['lastExportDir'] = folder
+        save_prefs(self.prefs)
+
+        fname = sanitize_filename(
+            self.mat_filename_edit.text(), default='signals', ext='.mat')
+        path = os.path.join(folder, fname)
+        base_name = os.path.splitext(fname)[0]
+        dtype = self.mat_type_combo.currentText()
+
+        if dtype == 'double':
+            mat_dict = {}
+            for var, d in data_out.items():
+                mat_dict[var] = {
+                    'time': np.asarray(d['t'], dtype=float),
+                    'value': np.asarray(d['v'], dtype=float),
+                    'name': d['name'],
+                    'unit': d['unit'],
+                }
+            try:
+                scipy_savemat(path, mat_dict, do_compression=True)
+            except Exception as e:
+                self.log(f'Ошибка .mat: {e}')
+                return
+            self.log(f'Сохранено: {path} [double]')
+            QMessageBox.information(
+                self, 'Готово',
+                f'Файл: {fname}\nСигналов: {len(data_out)}\n'
+                f'Тип: double')
+        else:
+            mat_dict = {}
+            for var, d in data_out.items():
+                mat_dict[var] = {
+                    'Time': np.asarray(d['t'], dtype=float),
+                    'Data': np.asarray(d['v'], dtype=float),
+                    'Name': d['name'],
+                    'Unit': d['unit'],
+                }
+            try:
+                scipy_savemat(path, mat_dict, do_compression=True)
+            except Exception as e:
+                self.log(f'Ошибка .mat: {e}')
+                return
+
+            m_path = os.path.join(folder, base_name + '_load.m')
+            try:
+                with open(m_path, 'w', encoding='utf-8') as fm:
+                    fm.write(f"% Auto-generated\nS = load('{fname}');\n")
+                    for var in data_out:
+                        fm.write(
+                            f'\n{var} = timeseries(S.{var}.Data, '
+                            f'S.{var}.Time);\n'
+                            f'{var}.Name = S.{var}.Name;\n'
+                        )
+                    fm.write('\nclear S;\n')
+            except OSError:
+                pass
+            self.log(f'Сохранено: {path} [timeseries]')
+            QMessageBox.information(
+                self, 'Готово',
+                f'Файл: {fname}\nСигналов: {len(data_out)}\n'
+                f'Тип: timeseries\nСкрипт: {base_name}_load.m')
+
+
+# ---------------------------------------------------------------------------
+def main():
+    pg.setConfigOptions(antialias=True)
+    app = QApplication(sys.argv)
+    win = MainWindow()
+    win.show()
+    sys.exit(app.exec_())
+
+
+if __name__ == '__main__':
+    main()
