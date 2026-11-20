@@ -3,19 +3,27 @@
 TRC Signal Plotter — PyQtGraph edition.
 
 GUI для построения сигналов из .trc (PCAN) файлов по описанию .dbc.
-Заголовок графика, подписи осей и подписи в легенде редактируются
-непосредственно в окне графика. Фон графика и пределы осей настраиваются
-в окне графика. Есть дерево кривых с чекбоксами видимости и возможность
-перемещать кривую на другую ось.
 
-Правая область окна графика содержит две колонки:
-  • «Настройки графика»        — сетка, легенда, фон, пределы осей;
-  • «Редактирование отображения» — заголовок, подписи, стиль, оси кривых.
-Обе колонки можно скрывать независимо друг от друга.
+Окно графика:
+  • слева — область построения;
+  • справа — QTabWidget с тремя вкладками:
+      – «Настройки графика»          — сетка, легенда, фон, пределы осей;
+      – «Редактирование отображения» — заголовок, подписи, стиль, оси кривых;
+      – «Кривые на графике»          — таблица кривых с чекбоксами видимости,
+        колонкой «Ось» и колонкой «Значение» (значение в точке выделителя X).
+  Всю правую панель можно скрыть/показать одним чекбоксом «Показать меню графика».
 
-Сетка по Y включается отдельно для каждой оси Y.
+Одиночный ЛКМ-клик по графику ставит вертикальный выделитель X;
+значения всех кривых в этой точке отображаются в колонке «Значение»
+вкладки «Кривые на графике» (если в точке X нет точного значения —
+берётся последнее с X ≤ курсор).
 
-Масштабирование мышью (базовый режим — увеличение области, mouse mode = 1):
+Двойной ЛКМ по подписи любой оси (слева или справа) — диалог ввода
+нового названия оси. Двойной ЛКМ по заголовку графика — диалог ввода
+названия графика. Заголовок можно скрыть чекбоксом
+«Показывать заголовок» на вкладке «Редактирование отображения».
+
+Масштабирование мышью (mouse mode = RectMode):
 ЛКМ-протяжка (область), Shift+ЛКМ (только X), Ctrl+ЛКМ (только Y),
 ПКМ — панорамирование, СКМ — авто-пределы осей.
 
@@ -43,6 +51,7 @@ from PyQt5.QtWidgets import (
     QTreeWidgetItem, QSplitter, QTabWidget, QPlainTextEdit, QFileDialog,
     QColorDialog, QMessageBox, QProgressBar, QDialog, QGroupBox,
     QFormLayout, QGridLayout, QAbstractItemView, QFrame,
+    QStyledItemDelegate, QInputDialog,
 )
 
 import pyqtgraph as pg
@@ -79,8 +88,11 @@ LINE_STYLES = {
 
 MARKERS = ['none', 'o', 's', 't', 'd', '+', 'x', 'p', 'h', 'star']
 
-# Время в TRC хранится в миллисекундах
 TIME_SCALE_TO_SECONDS = 1.0 / 1000.0
+CURSOR_COLOR = (220, 50, 50, 220)
+
+# Отступ автомасштаба по Y: 10 % от размаха (max-min) сверху и снизу
+AUTO_SCALE_PAD_FRAC = 0.10
 
 
 # ---------------------------------------------------------------------------
@@ -393,6 +405,53 @@ def _parse_limit(s):
         return None, False
 
 
+def last_value_at_x(t, v, x):
+    """Последнее значение v при t <= x. Если t[0] > x — вернуть (None, None)."""
+    t = np.asarray(t, dtype=float)
+    v = np.asarray(v, dtype=float)
+    if len(t) == 0:
+        return None, None
+    if not (np.all(np.diff(t) >= 0)):
+        order = np.argsort(t, kind='stable')
+        t = t[order]
+        v = v[order]
+    idx = np.searchsorted(t, x, side='right') - 1
+    if idx < 0:
+        return None, None
+    return t[idx], v[idx]
+
+
+def padded_range(dmin, dmax):
+    """Авто-диапазон Y: [dmin - 10%, dmax + 10%] от (dmax - dmin)."""
+    if not (np.isfinite(dmin) and np.isfinite(dmax)):
+        return dmin, dmax
+    span = dmax - dmin
+    pad = AUTO_SCALE_PAD_FRAC * span if span > 0 else 0.0
+    return dmin - pad, dmax + pad
+
+
+# ---------------------------------------------------------------------------
+# Дерево сигналов: Signal слева (2/3), Unit справа (1/3)
+# ---------------------------------------------------------------------------
+class SignalsTree(QTreeWidget):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._widths_applied = False
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self._widths_applied:
+            return
+        w = self.viewport().width()
+        if w <= 100:
+            return
+        unit_w = max(80, w // 3)
+        signal_w = w - unit_w
+        self.setColumnWidth(0, signal_w)
+        self.setColumnWidth(1, unit_w)
+        self._widths_applied = True
+
+
 # ---------------------------------------------------------------------------
 # ViewBox с выделением области
 # ---------------------------------------------------------------------------
@@ -497,13 +556,17 @@ class PassiveViewBox(pg.ViewBox):
 
 
 # ---------------------------------------------------------------------------
-# Мульти-осевой виджет
+# Мульти-осевой виджет + вертикальный выделитель
 # ---------------------------------------------------------------------------
 class MultiAxisPlotWidget(pg.GraphicsLayoutWidget):
     AXIS_WIDTH = 60
     Z_BASE = 1000
 
     auto_limits_requested = pyqtSignal()
+    sig_cursor_x = pyqtSignal(float)
+    screenshot_taken = pyqtSignal()
+    sig_axis_double_clicked = pyqtSignal(int)      # 0 = главная, >0 = доп. ось
+    sig_title_double_clicked = pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -532,8 +595,157 @@ class MultiAxisPlotWidget(pg.GraphicsLayoutWidget):
         self.legend = self.main_plot.addLegend(offset=(-10, 10))
         self.legend.setVisible(False)
 
+        self.cursor_line = pg.InfiniteLine(
+            angle=90, movable=False,
+            pen=pg.mkPen(CURSOR_COLOR, width=1.5),
+        )
+        self.cursor_line.setZValue(150)
+        self.cursor_line.setVisible(False)
+        self.main_plot.addItem(self.cursor_line, ignoreBounds=True)
+
         self.extra_axes = []
         self._resize_connected = False
+
+        self._scene_click_connected = False
+        self._install_scene_click_handler()
+
+        # Кнопка скриншота в правом нижнем углу
+        self.screenshot_btn = QPushButton('📷 Скриншот', self)
+        self.screenshot_btn.setToolTip('Скопировать область графика в буфер обмена')
+        self.screenshot_btn.setCursor(Qt.PointingHandCursor)
+        self.screenshot_btn.setStyleSheet(
+            'QPushButton {'
+            '  background-color: rgba(45, 45, 45, 190);'
+            '  color: #ffffff;'
+            '  border: 1px solid rgba(255, 255, 255, 90);'
+            '  border-radius: 4px;'
+            '  padding: 4px 8px;'
+            '  font-size: 11px;'
+            '}'
+            'QPushButton:hover {'
+            '  background-color: rgba(70, 70, 70, 230);'
+            '}'
+            'QPushButton:pressed {'
+            '  background-color: rgba(30, 30, 30, 240);'
+            '}'
+        )
+        self.screenshot_btn.adjustSize()
+        self.screenshot_btn.clicked.connect(self.copy_screenshot_to_clipboard)
+        self._position_screenshot_btn()
+
+    def _position_screenshot_btn(self):
+        if not hasattr(self, 'screenshot_btn'):
+            return
+        margin = 10
+        self.screenshot_btn.adjustSize()
+        x = max(margin, self.width() - self.screenshot_btn.width() - margin)
+        y = max(margin, self.height() - self.screenshot_btn.height() - margin)
+        self.screenshot_btn.move(x, y)
+        self.screenshot_btn.raise_()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._position_screenshot_btn()
+
+    def mouseDoubleClickEvent(self, ev):
+        """Ловим двойной ЛКМ по оси или заголовку до диспетчеризации в сцене."""
+        try:
+            if ev.button() == Qt.LeftButton:
+                scene_pos = self.mapToScene(ev.pos())
+
+                # Главная (левая) ось
+                try:
+                    left_axis = self.main_plot.getAxis('left')
+                    if left_axis is not None:
+                        r = left_axis.sceneBoundingRect()
+                        if (r.width() > 0 and r.height() > 0
+                                and r.contains(scene_pos)):
+                            self.sig_axis_double_clicked.emit(0)
+                            ev.accept()
+                            return
+                except Exception:
+                    pass
+
+                # Дополнительные оси
+                for i, info in enumerate(self.extra_axes):
+                    try:
+                        r = info['axis'].sceneBoundingRect()
+                        if (r.width() > 0 and r.height() > 0
+                                and r.contains(scene_pos)):
+                            self.sig_axis_double_clicked.emit(i + 1)
+                            ev.accept()
+                            return
+                    except Exception:
+                        pass
+
+                # Заголовок
+                try:
+                    title = self.main_plot.titleLabel
+                    if title is not None and title.isVisible():
+                        r = title.sceneBoundingRect()
+                        if (r.width() > 0 and r.height() > 0
+                                and r.contains(scene_pos)):
+                            self.sig_title_double_clicked.emit()
+                            ev.accept()
+                            return
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        super().mouseDoubleClickEvent(ev)
+
+    def copy_screenshot_to_clipboard(self):
+        self.screenshot_btn.hide()
+        QApplication.processEvents()
+        try:
+            pixmap = self.grab()
+            QApplication.clipboard().setPixmap(pixmap)
+            self.screenshot_taken.emit()
+        finally:
+            self.screenshot_btn.show()
+
+    def _install_scene_click_handler(self):
+        try:
+            sc = self.scene()
+        except Exception:
+            sc = None
+        if sc is None:
+            QTimer.singleShot(0, self._install_scene_click_handler)
+            return
+        if self._scene_click_connected:
+            return
+        try:
+            sc.sigMouseClicked.connect(self._on_scene_mouse_click)
+            self._scene_click_connected = True
+        except Exception:
+            QTimer.singleShot(50, self._install_scene_click_handler)
+
+    def _on_scene_mouse_click(self, ev):
+        try:
+            if ev.button() != Qt.LeftButton:
+                return
+            vb = self.main_plot.vb
+            scene_pos = ev.scenePos()
+            if not vb.sceneBoundingRect().contains(scene_pos):
+                return
+            vb_pos = vb.mapSceneToView(scene_pos)
+            if not vb.viewRect().contains(vb_pos):
+                return
+            self.sig_cursor_x.emit(float(vb_pos.x()))
+        except Exception:
+            pass
+
+    def set_cursor_x(self, x):
+        try:
+            self.cursor_line.setPos(float(x))
+        except Exception:
+            pass
+
+    def set_cursor_visible(self, visible):
+        try:
+            self.cursor_line.setVisible(bool(visible))
+        except Exception:
+            pass
 
     def mousePressEvent(self, ev):
         if ev.button() == Qt.MiddleButton:
@@ -611,6 +823,8 @@ class MultiAxisPlotWidget(pg.GraphicsLayoutWidget):
     def clear_all_curves(self):
         self.legend.clear()
         self.main_plot.clear()
+        self.main_plot.addItem(self.cursor_line, ignoreBounds=True)
+        self.cursor_line.setVisible(False)
         for info in self.extra_axes:
             for line in info.get('grid_lines', []):
                 try:
@@ -678,6 +892,67 @@ class MultiAxisPlotWidget(pg.GraphicsLayoutWidget):
 
 
 # ---------------------------------------------------------------------------
+# Делегат для инлайн-редактирования кривых (имя / ось)
+# ---------------------------------------------------------------------------
+class CurvesDelegate(QStyledItemDelegate):
+    """Редактирование колонки «Кривая» (текст) и «Ось» (QComboBox)."""
+
+    def __init__(self, plot_window, tree, parent=None):
+        super().__init__(parent)
+        self.plot_window = plot_window
+        self.tree = tree
+
+    def createEditor(self, parent, option, index):
+        col = index.column()
+        if col == 1:
+            return super().createEditor(parent, option, index)
+        if col == 2:
+            combo = QComboBox(parent)
+            n = len(self.plot_window.plots_per_axes)
+            for k in range(n):
+                combo.addItem(f'Ось {k + 1}', k)
+            combo.addItem('Новая ось', n)
+            item = self.tree.itemFromIndex(index)
+            if item is not None:
+                data = item.data(0, Qt.UserRole)
+                if data:
+                    ai, _ = data
+                    for k in range(combo.count()):
+                        if combo.itemData(k) == ai:
+                            combo.setCurrentIndex(k)
+                            break
+            return combo
+        return None
+
+    def setModelData(self, editor, model, index):
+        col = index.column()
+        if col == 1:
+            super().setModelData(editor, model, index)
+            return
+        if col == 2 and isinstance(editor, QComboBox):
+            item = self.tree.itemFromIndex(index)
+            if item is None:
+                return
+            data = item.data(0, Qt.UserRole)
+            if not data:
+                return
+            ai_src, j_src = data
+            target = editor.currentData()
+            if target is None or target == ai_src:
+                return
+            pw = self.plot_window
+            QTimer.singleShot(
+                0, lambda: self._safe_move(pw, ai_src, j_src, target))
+
+    @staticmethod
+    def _safe_move(pw, ai_src, j_src, target):
+        try:
+            pw.perform_curve_axis_move(ai_src, j_src, target)
+        except RuntimeError:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # Окно графика
 # ---------------------------------------------------------------------------
 class PlotWindow(QDialog):
@@ -691,6 +966,12 @@ class PlotWindow(QDialog):
         self.window_title = title
         self.setWindowTitle(title)
         self.resize(1500, 900)
+
+        self.title_visible = True
+
+        self.setWindowFlags(
+            self.windowFlags() | Qt.WindowMinMaxButtonsHint
+        )
 
         self.plots_per_axes = [[]]
         self.axes_colors = [None]
@@ -706,10 +987,22 @@ class PlotWindow(QDialog):
         self._picked_color = None
         self.y_grid_checkboxes = []
 
+        self._cursor_x = None
+
         self._build_ui()
 
         self.plot_widget.auto_limits_requested.connect(
             self._on_middle_click_auto_limits)
+        self.plot_widget.sig_cursor_x.connect(self._on_cursor_x)
+        self.plot_widget.sig_axis_double_clicked.connect(
+            self._on_axis_double_clicked)
+        self.plot_widget.sig_title_double_clicked.connect(
+            self._on_title_double_clicked)
+        self.plot_widget.screenshot_taken.connect(
+            lambda: self.app.log(
+                f'Скриншот графика #{self.index} скопирован в буфер обмена.'
+            )
+        )
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self):
@@ -717,22 +1010,16 @@ class PlotWindow(QDialog):
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(4)
 
-        # ------- Верхняя строка с переключателями видимости панелей -------
+        # Верхняя строка — один переключатель меню графика
         top_row = QHBoxLayout()
-        self.show_panel_cb = QCheckBox('Показать панель настроек справа')
-        self.show_panel_cb.setChecked(True)
-        self.show_panel_cb.stateChanged.connect(self._toggle_side_panel)
-        top_row.addWidget(self.show_panel_cb)
-
-        self.show_edit_cb = QCheckBox('Показать панель редактирования')
-        self.show_edit_cb.setChecked(True)
-        self.show_edit_cb.stateChanged.connect(self._toggle_edit_panel)
-        top_row.addWidget(self.show_edit_cb)
-
+        self.show_menu_cb = QCheckBox('Показать меню графика')
+        self.show_menu_cb.setChecked(True)
+        self.show_menu_cb.stateChanged.connect(self._toggle_menu)
+        top_row.addWidget(self.show_menu_cb)
         top_row.addStretch()
         layout.addLayout(top_row)
 
-        # ------- Площадка графика + правая панель (две колонки) -------
+        # Splitter: слева график, справа меню-вкладки
         plot_area = QSplitter(Qt.Horizontal)
         plot_area.setChildrenCollapsible(True)
         plot_area.setHandleWidth(4)
@@ -740,70 +1027,35 @@ class PlotWindow(QDialog):
         self.plot_widget = MultiAxisPlotWidget()
         plot_area.addWidget(self.plot_widget)
 
-        # Правая панель: контейнер из двух независимых колонок
-        self.side_panel = QWidget()
-        sp_layout = QHBoxLayout(self.side_panel)
-        sp_layout.setContentsMargins(0, 0, 0, 0)
-        sp_layout.setSpacing(4)
+        self.tab_menu = QTabWidget()
+        self.tab_menu.setMinimumWidth(360)
 
-        self.settings_panel = self._build_side_panel()
-        sp_layout.addWidget(self.settings_panel)
+        self.tab_settings = self._build_side_panel()
+        self.tab_edit = self._build_edit_panel()
+        self.tab_curves = self._build_curves_tab()
 
-        self.edit_panel = self._build_edit_panel()
-        sp_layout.addWidget(self.edit_panel)
+        self.tab_menu.addTab(self.tab_settings, 'Настройки графика')
+        self.tab_menu.addTab(self.tab_edit, 'Редактирование отображения')
+        self.tab_menu.addTab(self.tab_curves, 'Кривые на графике')
 
-        plot_area.addWidget(self.side_panel)
+        plot_area.addWidget(self.tab_menu)
 
         plot_area.setStretchFactor(0, 1)
         plot_area.setStretchFactor(1, 0)
-        plot_area.setSizes([700, 700])
+        plot_area.setSizes([900, 450])
 
         layout.addWidget(plot_area, stretch=1)
 
-        # ------- Дерево кривых (внизу) -------
-        curves_panel = QGroupBox('Кривые на графике')
-        cp = QVBoxLayout(curves_panel)
-        cp.setContentsMargins(4, 4, 4, 4)
-        self.curves_tree = QTreeWidget()
-        self.curves_tree.setHeaderLabels(['Видимость', 'Кривая', 'Ось'])
-        self.curves_tree.setRootIsDecorated(False)
-        self.curves_tree.setAlternatingRowColors(True)
-        self.curves_tree.setMaximumHeight(150)
-        self.curves_tree.setColumnWidth(0, 80)
-        self.curves_tree.setColumnWidth(1, 700)
-        self.curves_tree.setColumnWidth(2, 70)
-        self.curves_tree.itemChanged.connect(
-            self._on_curve_visibility_changed)
-        cp.addWidget(self.curves_tree)
-        row = QHBoxLayout()
-        b = QPushButton('Показать все')
-        b.clicked.connect(self._show_all_curves)
-        row.addWidget(b)
-        b = QPushButton('Скрыть все')
-        b.clicked.connect(self._hide_all_curves)
-        row.addWidget(b)
-        row.addStretch()
-        cp.addLayout(row)
-        layout.addWidget(curves_panel)
-
         self._refresh_curve_axis_combo()
 
-    # --------------------------------------------------- Левая колонка
+    # --------------------------------------------------- Левая вкладка
     def _build_side_panel(self):
-        """Левая колонка правой панели — «Настройки графика»."""
-        panel = QFrame()
-        panel.setFrameShape(QFrame.StyledPanel)
-        panel.setMinimumWidth(220)
-        panel.setMaximumWidth(280)
+        panel = QWidget()
         v = QVBoxLayout(panel)
         v.setContentsMargins(6, 6, 6, 6)
         v.setSpacing(6)
 
         self.y_grid_checkboxes = []
-
-        title = QLabel('Настройки графика')
-        title.setStyleSheet('font-weight: bold;')
-        v.addWidget(title)
 
         b = QPushButton('Показать всё')
         b.clicked.connect(self._view_all)
@@ -813,7 +1065,6 @@ class PlotWindow(QDialog):
         b.clicked.connect(self._on_middle_click_auto_limits)
         v.addWidget(b)
 
-        # --- Сетка
         grid_box = QGroupBox('Сетка')
         gb = QVBoxLayout(grid_box)
         self.grid_x_cb = QCheckBox('По X')
@@ -828,14 +1079,12 @@ class PlotWindow(QDialog):
         gb.addWidget(self.grid_y_container)
         v.addWidget(grid_box)
 
-        # --- Легенда (единственный переключатель легенды)
         self.side_legend_cb = QCheckBox('Показывать легенду')
         self.side_legend_cb.setChecked(self.show_legend)
         self.side_legend_cb.stateChanged.connect(
             self._toggle_legend_from_panel)
         v.addWidget(self.side_legend_cb)
 
-        # --- Фон графика
         bg_box = QGroupBox('Фон графика')
         bgb = QVBoxLayout(bg_box)
         row = QHBoxLayout()
@@ -848,7 +1097,6 @@ class PlotWindow(QDialog):
         bgb.addLayout(row)
         v.addWidget(bg_box)
 
-        # --- Пределы осей
         lim_box = QGroupBox('Пределы осей')
         lb = QVBoxLayout(lim_box)
 
@@ -895,7 +1143,10 @@ class PlotWindow(QDialog):
                       'Shift+ЛКМ = только X\n'
                       'Ctrl+ЛКМ = только Y\n'
                       'ПКМ = панорамирование\n'
-                      'СКМ = авто-пределы')
+                      'СКМ = авто-пределы\n'
+                      'ЛКМ-клик = выделитель X\n'
+                      'Двойной клик по оси = имя оси\n'
+                      'Двойной клик по заголовку = имя графика')
         info.setStyleSheet('color: #666; font-size: 10px;')
         v.addWidget(info)
 
@@ -906,16 +1157,13 @@ class PlotWindow(QDialog):
         self._refresh_grid_axes()
         return panel
 
-    # -------------------------------------------------- Правая колонка
+    # -------------------------------------------------- Средняя вкладка
     def _build_edit_panel(self):
-        """Правая колонка правой панели — «Редактирование отображения»."""
-        panel = QGroupBox('Редактирование отображения')
-        panel.setMinimumWidth(420)
-        panel.setMaximumWidth(620)
+        panel = QWidget()
         edit_layout = QVBoxLayout(panel)
+        edit_layout.setContentsMargins(6, 6, 6, 6)
         edit_layout.setSpacing(4)
 
-        # Заголовок
         row = QHBoxLayout()
         row.addWidget(QLabel('Заголовок:'))
         self.title_edit = QLineEdit()
@@ -926,7 +1174,14 @@ class PlotWindow(QDialog):
         row.addWidget(b)
         edit_layout.addLayout(row)
 
-        # Подпись оси
+        row = QHBoxLayout()
+        self.title_visible_cb = QCheckBox('Показывать заголовок')
+        self.title_visible_cb.setChecked(True)
+        self.title_visible_cb.stateChanged.connect(self._toggle_title_visible)
+        row.addWidget(self.title_visible_cb)
+        row.addStretch()
+        edit_layout.addLayout(row)
+
         row = QHBoxLayout()
         row.addWidget(QLabel('Ось:'))
         self.axis_combo = QComboBox()
@@ -941,7 +1196,6 @@ class PlotWindow(QDialog):
         row.addWidget(b)
         edit_layout.addLayout(row)
 
-        # Цвет оси
         row = QHBoxLayout()
         row.addWidget(QLabel('Цвет оси:'))
         self.axis_color_btn = QPushButton('Авто')
@@ -952,7 +1206,6 @@ class PlotWindow(QDialog):
         row.addWidget(b)
         edit_layout.addLayout(row)
 
-        # Кривая
         row = QHBoxLayout()
         row.addWidget(QLabel('Кривая:'))
         self.curve_combo = QComboBox()
@@ -961,7 +1214,6 @@ class PlotWindow(QDialog):
         row.addWidget(self.curve_combo, stretch=1)
         edit_layout.addLayout(row)
 
-        # Подпись в легенде
         row = QHBoxLayout()
         row.addWidget(QLabel('Легенда:'))
         self.legend_edit = QLineEdit()
@@ -972,7 +1224,6 @@ class PlotWindow(QDialog):
         row.addWidget(b)
         edit_layout.addLayout(row)
 
-        # Ось кривой
         row = QHBoxLayout()
         row.addWidget(QLabel('Ось кривой:'))
         self.curve_axis_combo = QComboBox()
@@ -983,7 +1234,6 @@ class PlotWindow(QDialog):
         row.addWidget(b)
         edit_layout.addLayout(row)
 
-        # Цвет кривой
         row = QHBoxLayout()
         row.addWidget(QLabel('Цвет:'))
         self.color_btn = QPushButton('Авто')
@@ -994,7 +1244,6 @@ class PlotWindow(QDialog):
         row.addWidget(b)
         edit_layout.addLayout(row)
 
-        # Стиль линии — разбит на два ряда, чтобы подписи не наезжали
         row = QHBoxLayout()
         row.addWidget(QLabel('Тип:'))
         self.line_style_combo = QComboBox()
@@ -1024,7 +1273,6 @@ class PlotWindow(QDialog):
         row.addStretch()
         edit_layout.addLayout(row)
 
-        # Кнопки
         row = QHBoxLayout()
         b = QPushButton('Применить стиль')
         b.clicked.connect(self.apply_style)
@@ -1046,13 +1294,48 @@ class PlotWindow(QDialog):
         edit_layout.addStretch()
         return panel
 
-    # ------------------------------------------------- видимость панелей
-    def _toggle_side_panel(self, state):
-        self.side_panel.setVisible(state == Qt.Checked)
-        QTimer.singleShot(0, self._after_panel_toggle)
+    # -------------------------------------------------- Правая вкладка
+    def _build_curves_tab(self):
+        panel = QWidget()
+        v = QVBoxLayout(panel)
+        v.setContentsMargins(6, 6, 6, 6)
+        v.setSpacing(4)
 
-    def _toggle_edit_panel(self, state):
-        self.edit_panel.setVisible(state == Qt.Checked)
+        self.cursor_label = QLabel(
+            'Выделитель X: не задан. Кликните ЛКМ по графику.')
+        self.cursor_label.setStyleSheet('font-weight: bold;')
+        self.cursor_label.setWordWrap(True)
+        v.addWidget(self.cursor_label)
+
+        self.curves_tree = QTreeWidget()
+        self.curves_tree.setHeaderLabels(
+            ['Видимость', 'Кривая', 'Ось', 'Значение'])
+        self.curves_tree.setRootIsDecorated(False)
+        self.curves_tree.setAlternatingRowColors(True)
+        self.curves_tree.setColumnWidth(0, 70)
+        self.curves_tree.setColumnWidth(1, 180)
+        self.curves_tree.setColumnWidth(2, 50)
+        self.curves_tree.setColumnWidth(3, 110)
+        self.curves_tree.itemChanged.connect(self._on_curves_item_changed)
+        v.addWidget(self.curves_tree, stretch=1)
+        self._curves_delegate = CurvesDelegate(self, self.curves_tree, self)
+        self.curves_tree.setItemDelegate(self._curves_delegate)
+
+        row = QHBoxLayout()
+        b = QPushButton('Показать все')
+        b.clicked.connect(self._show_all_curves)
+        row.addWidget(b)
+        b = QPushButton('Скрыть все')
+        b.clicked.connect(self._hide_all_curves)
+        row.addWidget(b)
+        row.addStretch()
+        v.addLayout(row)
+
+        return panel
+
+    # ------------------------------------------------- видимость меню
+    def _toggle_menu(self, state):
+        self.tab_menu.setVisible(state == Qt.Checked)
         QTimer.singleShot(0, self._after_panel_toggle)
 
     def _after_panel_toggle(self):
@@ -1073,7 +1356,6 @@ class PlotWindow(QDialog):
 
     # ----------------------------------------------------- сетка
     def _refresh_grid_axes(self):
-        """Пересоздать чекбоксы «По Y» — по одному на каждую ось."""
         if not hasattr(self, 'grid_y_container'):
             return
         n = len(self.plots_per_axes)
@@ -1123,7 +1405,6 @@ class PlotWindow(QDialog):
             pass
 
     def _set_extra_axis_grid(self, ai, y_enabled):
-        """Горизонтальные линии сетки для доп. Y-оси ai (>=1)."""
         if ai - 1 >= len(self.plot_widget.extra_axes):
             return
         info = self.plot_widget.extra_axes[ai - 1]
@@ -1205,6 +1486,85 @@ class PlotWindow(QDialog):
         except Exception:
             pass
 
+    # -------------------------------------------------------- выделитель
+    def _on_cursor_x(self, x):
+        self._cursor_x = float(x)
+        self._apply_cursor()
+
+    def _apply_cursor(self):
+        if self._cursor_x is None:
+            try:
+                self.plot_widget.set_cursor_visible(False)
+            except Exception:
+                pass
+            self._clear_cursor_values()
+            return
+        try:
+            self.plot_widget.set_cursor_x(self._cursor_x)
+            self.plot_widget.set_cursor_visible(True)
+        except Exception:
+            pass
+        self._update_cursor_info(self._cursor_x)
+
+    def _clear_cursor_values(self):
+        try:
+            self.cursor_label.setText(
+                'Выделитель X: не задан. Кликните ЛКМ по графику.')
+        except Exception:
+            pass
+        if not hasattr(self, 'curves_tree'):
+            return
+        try:
+            self.curves_tree.blockSignals(True)
+            for i in range(self.curves_tree.topLevelItemCount()):
+                item = self.curves_tree.topLevelItem(i)
+                item.setText(3, '')
+        finally:
+            try:
+                self.curves_tree.blockSignals(False)
+            except Exception:
+                pass
+
+    def _update_cursor_info(self, x):
+        try:
+            self.cursor_label.setText(f'Выделитель X = {x:.6g} с')
+        except Exception:
+            pass
+        if not hasattr(self, 'curves_tree'):
+            return
+        try:
+            self.curves_tree.blockSignals(True)
+            for i in range(self.curves_tree.topLevelItemCount()):
+                item = self.curves_tree.topLevelItem(i)
+                data = item.data(0, Qt.UserRole)
+                if not data:
+                    continue
+                ai, j = data
+                if ai >= len(self.plots_per_axes) or \
+                        j >= len(self.plots_per_axes[ai]):
+                    item.setText(3, '—')
+                    continue
+                p = self.plots_per_axes[ai][j]
+                try:
+                    t = np.asarray(p['t'], dtype=float)
+                    v = np.asarray(p['v'], dtype=float)
+                except Exception:
+                    item.setText(3, '—')
+                    continue
+                if len(t) == 0:
+                    item.setText(3, '—')
+                    continue
+                tv, vv = last_value_at_x(t, v, x)
+                if tv is None or not np.isfinite(vv):
+                    item.setText(3, '—')
+                else:
+                    item.setText(3, f'{vv:.6g}')
+        finally:
+            try:
+                self.curves_tree.blockSignals(False)
+            except Exception:
+                pass
+
     def add_plots(self, new_plots, axis_choice, custom_color):
         n_axes = len(self.plots_per_axes)
         if axis_choice >= n_axes:
@@ -1218,7 +1578,7 @@ class PlotWindow(QDialog):
 
     def set_background(self, qcolor):
         self.background_color = qcolor
-        self.redraw()
+        self.redraw(preserve_view=True)
         self._update_bg_btn()
 
     def _is_dark_bg(self):
@@ -1269,7 +1629,51 @@ class PlotWindow(QDialog):
             pass
 
     # ------------------------------------------------------------- отрисовка
-    def redraw(self):
+    def _save_current_view(self):
+        """Сохранить текущие диапазоны осей (X главного + Y каждой оси)."""
+        saved_x = None
+        saved_ys = []
+        try:
+            saved_x = list(self.plot_widget.main_plot.vb.viewRange()[0])
+            for i in range(len(self.plots_per_axes)):
+                if i == 0:
+                    vb = self.plot_widget.main_plot.vb
+                elif i - 1 < len(self.plot_widget.extra_axes):
+                    vb = self.plot_widget.extra_axes[i - 1]['vb']
+                else:
+                    vb = None
+                saved_ys.append(
+                    list(vb.viewRange()[1]) if vb is not None else None)
+        except Exception:
+            return None, []
+        return saved_x, saved_ys
+
+    def _restore_view(self, saved_x, saved_ys):
+        """Восстановить сохранённые диапазоны осей."""
+        if saved_x is not None:
+            try:
+                self.plot_widget.set_xlim(saved_x[0], saved_x[1])
+            except Exception:
+                pass
+        for i, yr in enumerate(saved_ys):
+            if yr is None:
+                continue
+            try:
+                self.plot_widget.set_ylim(i, yr[0], yr[1])
+            except Exception:
+                pass
+        try:
+            self._update_grid()
+        except Exception:
+            pass
+
+    def redraw(self, preserve_view=False):
+        # --- сохранить вид, если запрошено ---
+        saved_x = None
+        saved_ys = []
+        if preserve_view:
+            saved_x, saved_ys = self._save_current_view()
+
         n_axes = len(self.plots_per_axes)
 
         self.plot_widget.clear_all_curves()
@@ -1358,13 +1762,29 @@ class PlotWindow(QDialog):
         self.plot_widget.main_plot.setTitle(
             title_text, color=self._fg_qcolor.name())
 
+        # Применить видимость заголовка (setTitle всегда делает его видимым)
+        try:
+            title_lbl = self.plot_widget.main_plot.titleLabel
+            if title_lbl is not None:
+                title_lbl.setVisible(self.title_visible)
+        except Exception:
+            pass
+
         self.plot_widget.set_legend_visible(self.show_legend)
         if hasattr(self, 'side_legend_cb'):
             self.side_legend_cb.blockSignals(True)
             self.side_legend_cb.setChecked(self.show_legend)
             self.side_legend_cb.blockSignals(False)
 
-        self._recompute_ranges()
+        # --- восстановить вид или пересчитать пределы ---
+        restored = (
+            preserve_view and saved_x is not None
+            and len(saved_ys) == len(self.plots_per_axes)
+        )
+        if restored:
+            self._restore_view(saved_x, saved_ys)
+        else:
+            self._recompute_ranges()
 
         try:
             self.plot_widget._update_positions()
@@ -1378,7 +1798,10 @@ class PlotWindow(QDialog):
         self._refresh_limit_axis_combo()
         self._update_bg_btn()
 
-        QTimer.singleShot(10, self._recompute_ranges)
+        self._apply_cursor()
+
+        if not restored:
+            QTimer.singleShot(10, self._recompute_ranges)
 
         self.state_changed.emit()
 
@@ -1424,10 +1847,13 @@ class PlotWindow(QDialog):
 
             if ys:
                 all_y = np.concatenate(ys)
+                dmin = float(all_y.min())
+                dmax = float(all_y.max())
+                auto_lo, auto_hi = padded_range(dmin, dmax)
                 if ymin is None:
-                    ymin = float(all_y.min())
+                    ymin = auto_lo
                 if ymax is None:
-                    ymax = float(all_y.max())
+                    ymax = auto_hi
 
             if ymin is None or ymax is None:
                 continue
@@ -1464,10 +1890,13 @@ class PlotWindow(QDialog):
                       if ai < len(self.y_limits) else (None, None))
         if ys:
             all_y = np.concatenate(ys)
+            dmin = float(all_y.min())
+            dmax = float(all_y.max())
+            auto_lo, auto_hi = padded_range(dmin, dmax)
             if ymin is None:
-                ymin = float(all_y.min())
+                ymin = auto_lo
             if ymax is None:
-                ymax = float(all_y.max())
+                ymax = auto_hi
         if ymin is None or ymax is None:
             return
         if ymin == ymax:
@@ -1516,44 +1945,84 @@ class PlotWindow(QDialog):
         if not hasattr(self, 'curves_tree'):
             return
         self.curves_tree.blockSignals(True)
-        self.curves_tree.clear()
-        for ai, plots in enumerate(self.plots_per_axes):
-            for j, p in enumerate(plots):
-                item = QTreeWidgetItem()
-                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-                item.setCheckState(
-                    0, Qt.Checked if p.get('visible', True) else Qt.Unchecked)
-                item.setText(1, p.get('legend_label') or p['label'])
-                item.setText(2, f'Ось {ai + 1}')
-                item.setData(0, Qt.UserRole, (ai, j))
-                self.curves_tree.addTopLevelItem(item)
-        self.curves_tree.blockSignals(False)
+        try:
+            self.curves_tree.clear()
+            for ai, plots in enumerate(self.plots_per_axes):
+                for j, p in enumerate(plots):
+                    item = QTreeWidgetItem()
+                    item.setFlags(item.flags() | Qt.ItemIsUserCheckable
+                                  | Qt.ItemIsEditable)
+                    item.setCheckState(
+                        0, Qt.Checked if p.get('visible', True)
+                        else Qt.Unchecked)
+                    item.setText(1, p.get('legend_label') or p['label'])
+                    item.setText(2, f'Ось {ai + 1}')
+                    item.setText(3, '')
+                    item.setData(0, Qt.UserRole, (ai, j))
+                    self.curves_tree.addTopLevelItem(item)
+        finally:
+            try:
+                self.curves_tree.blockSignals(False)
+            except Exception:
+                pass
 
-    def _on_curve_visibility_changed(self, item, column):
-        if column != 0:
-            return
+    def _on_curves_item_changed(self, item, column):
         data = item.data(0, Qt.UserRole)
         if not data:
             return
         ai, j = data
         if ai >= len(self.plots_per_axes) or j >= len(self.plots_per_axes[ai]):
             return
+
+        if column == 0:
+            p = self.plots_per_axes[ai][j]
+            visible = (item.checkState(0) == Qt.Checked)
+            p['visible'] = visible
+            curve = self._curve_objects.get((ai, j))
+            if curve is not None:
+                try:
+                    curve.setVisible(visible)
+                except Exception:
+                    pass
+            self._recompute_ranges_for_axis(ai)
+            self.app.log(
+                f'Кривая «{p["label"]}» (Ось {ai + 1}) '
+                f'{"показана" if visible else "скрыта"}.')
+        elif column == 1:
+            self._apply_curve_name_from_tree(item, ai, j)
+
+    def _apply_curve_name_from_tree(self, item, ai, j):
         p = self.plots_per_axes[ai][j]
-        visible = (item.checkState(0) == Qt.Checked)
-        p['visible'] = visible
+        new_name = item.text(1).strip()
+        current_auto = p['label']
+        current_stored = p.get('legend_label')
 
-        curve = self._curve_objects.get((ai, j))
-        if curve is not None:
-            try:
-                curve.setVisible(visible)
-            except Exception:
-                pass
+        if new_name and new_name != current_auto:
+            new_stored = new_name
+        else:
+            new_stored = None
+        if new_stored == current_stored:
+            return
 
-        self._recompute_ranges_for_axis(ai)
+        if new_stored is None:
+            p.pop('legend_label', None)
+            display = current_auto
+        else:
+            p['legend_label'] = new_stored
+            display = new_stored
+
+        # Обновляем только легенду, без перестроения дерева
+        try:
+            curve = self._curve_objects.get((ai, j))
+            legend = self.plot_widget.legend
+            if curve is not None and legend is not None:
+                legend.removeItem(curve)
+                legend.addItem(curve, display)
+        except Exception:
+            pass
 
         self.app.log(
-            f'Кривая «{p["label"]}» (Ось {ai + 1}) '
-            f'{"показана" if visible else "скрыта"}.')
+            f'Подпись кривой обновлена: Ось {ai + 1} / {current_auto}.')
 
     def _show_all_curves(self):
         for plots in self.plots_per_axes:
@@ -1565,6 +2034,8 @@ class PlotWindow(QDialog):
             except Exception:
                 pass
         self._refresh_curves_tree()
+        if self._cursor_x is not None:
+            self._update_cursor_info(self._cursor_x)
         self._recompute_ranges()
         self.app.log('Показаны все кривые.')
 
@@ -1578,6 +2049,8 @@ class PlotWindow(QDialog):
             except Exception:
                 pass
         self._refresh_curves_tree()
+        if self._cursor_x is not None:
+            self._update_cursor_info(self._cursor_x)
         self.app.log('Скрыты все кривые.')
 
     def _on_axis_changed(self):
@@ -1641,8 +2114,69 @@ class PlotWindow(QDialog):
     def apply_title(self):
         txt = self.title_edit.text().strip()
         self.custom_title = txt if txt else None
-        self.redraw()
+        self.redraw(preserve_view=True)
         self.app.log(f'Заголовок графика #{self.index} обновлён.')
+
+    # ------------------- Редактирование по двойному клику -------------------
+    def _on_axis_double_clicked(self, ai):
+        """Двойной клик по оси на графике — запросить новое название."""
+        if ai >= len(self.plots_per_axes):
+            return
+        if ai < len(self.axis_labels) and self.axis_labels[ai]:
+            current = self.axis_labels[ai]
+        elif self.plots_per_axes[ai]:
+            current = self.plots_per_axes[ai][0]['label']
+        else:
+            current = f'Ось {ai + 1}'
+
+        new_text, ok = QInputDialog.getText(
+            self, f'Имя оси {ai + 1}',
+            'Введите название оси:', text=current)
+        if not ok:
+            return
+        new_text = new_text.strip()
+        if ai >= len(self.axis_labels):
+            return
+        self.axis_labels[ai] = new_text if new_text else None
+        self.redraw(preserve_view=True)
+        self.app.log(
+            f'Подпись оси {ai + 1} графика #{self.index} '
+            f'обновлена (двойной клик).')
+
+    def _on_title_double_clicked(self):
+        """Двойной клик по заголовку — запросить новое название графика."""
+        if not self.title_visible:
+            return
+        if self.custom_title:
+            current = self.custom_title
+        else:
+            try:
+                current = self.plot_widget.main_plot.titleLabel.text
+            except Exception:
+                current = ''
+        new_text, ok = QInputDialog.getText(
+            self, 'Заголовок графика',
+            'Введите название графика:', text=current)
+        if not ok:
+            return
+        new_text = new_text.strip()
+        self.custom_title = new_text if new_text else None
+        if hasattr(self, 'title_edit'):
+            self.title_edit.setText(new_text)
+        self.redraw(preserve_view=True)
+        self.app.log(
+            f'Заголовок графика #{self.index} обновлён (двойной клик).')
+
+    def _toggle_title_visible(self, state):
+        self.title_visible = (state == Qt.Checked)
+        try:
+            title = self.plot_widget.main_plot.titleLabel
+            if title is not None:
+                title.setVisible(self.title_visible)
+        except Exception:
+            pass
+        QTimer.singleShot(0, self._after_panel_toggle)
+        self.state_changed.emit()
 
     def apply_axis_label(self):
         ai = self.axis_combo.currentIndex()
@@ -1650,7 +2184,7 @@ class PlotWindow(QDialog):
             return
         txt = self.axis_label_edit.text().strip()
         self.axis_labels[ai] = txt if txt else None
-        self.redraw()
+        self.redraw(preserve_view=True)
         self.app.log(f'Подпись оси {ai + 1} графика #{self.index} обновлена.')
 
     def pick_axis_color(self):
@@ -1664,7 +2198,7 @@ class PlotWindow(QDialog):
             return
         self.axes_colors[ai] = (c.red() / 255.0, c.green() / 255.0,
                                 c.blue() / 255.0)
-        self.redraw()
+        self.redraw(preserve_view=True)
         self.app.log(
             f'Цвет оси {ai + 1} графика #{self.index} обновлён: {c.name()}.')
 
@@ -1673,7 +2207,7 @@ class PlotWindow(QDialog):
         if ai < 0 or ai >= len(self.axes_colors):
             return
         self.axes_colors[ai] = None
-        self.redraw()
+        self.redraw(preserve_view=True)
         self.app.log(
             f'Цвет оси {ai + 1} графика #{self.index} сброшен (авто).')
 
@@ -1698,7 +2232,7 @@ class PlotWindow(QDialog):
             p['legend_label'] = txt
         else:
             p.pop('legend_label', None)
-        self.redraw()
+        self.redraw(preserve_view=True)
         self.app.log(f'Подпись легенды обновлена: '
                      f'Ось {ai + 1} / {p["label"]}.')
 
@@ -1735,7 +2269,7 @@ class PlotWindow(QDialog):
         p['lineWidth'] = float(self.line_width_combo.currentText())
         p['marker'] = self.marker_combo.currentText()
         p['markerSize'] = float(self.marker_size_combo.currentText())
-        self.redraw()
+        self.redraw(preserve_view=True)
         self.app.log(f'Стиль применён: Ось {ai + 1} / {p["label"]}.')
 
     def delete_current_curve(self):
@@ -1762,6 +2296,7 @@ class PlotWindow(QDialog):
         self.x_limits = [None, None]
         self.axis_labels = [None]
         self.custom_title = None
+        self._cursor_x = None
         self.redraw()
         self.app.log(f'Все данные удалены с графика #{self.index}.')
 
@@ -1772,13 +2307,13 @@ class PlotWindow(QDialog):
         if not c.isValid():
             return
         self.background_color = c
-        self.redraw()
+        self.redraw(preserve_view=True)
         self._update_bg_btn()
         self.app.log(f'Фон графика #{self.index}: {c.name()}.')
 
     def reset_background(self):
         self.background_color = None
-        self.redraw()
+        self.redraw(preserve_view=True)
         self._update_bg_btn()
         self.app.log(f'Фон графика #{self.index}: авто (белый).')
 
@@ -1816,11 +2351,14 @@ class PlotWindow(QDialog):
             self.app.log('Не выбрана кривая для перемещения.')
             return
         ai_src, j_src = data
-        if (ai_src >= len(self.plots_per_axes)
-                or j_src >= len(self.plots_per_axes[ai_src])):
-            return
         target_idx = self.curve_axis_combo.currentIndex()
         if target_idx < 0:
+            return
+        self.perform_curve_axis_move(ai_src, j_src, target_idx)
+
+    def perform_curve_axis_move(self, ai_src, j_src, target_idx):
+        if (ai_src >= len(self.plots_per_axes)
+                or j_src >= len(self.plots_per_axes[ai_src])):
             return
         n_axes = len(self.plots_per_axes)
         if target_idx == ai_src:
@@ -1974,9 +2512,12 @@ class MainWindow(QMainWindow):
         self.log('Шаг 1: выберите .trc файл → «Читать TRC».')
         self.log('Шаг 2: выберите .dbc файл.')
         self.log('Шаг 3: выберите сообщение/сигналы → «Построить график».')
-        self.log('В окне графика можно редактировать заголовок, '
-                 'подписи осей, цвет осей, легенду и видимость кривых.')
-        self.log('Функции контекстного меню ПКМ — в панели справа от графика.')
+        self.log('Меню графика — вкладки: Настройки, Редактирование, '
+                 'Кривые. Значения при клике — в колонке «Значение».')
+        self.log('ЛКМ-клик по графику ставит вертикальный выделитель X; '
+                 'значения кривых отображаются в «Кривые на графике».')
+        self.log('Двойной ЛКМ по оси = переименовать ось; '
+                 'по заголовку = переименовать график.')
         self.log('СКМ по графику — сброс пределов осей в «авто».')
         if not HAS_SCIPY:
             self.log('Внимание: scipy не установлен — экспорт .mat недоступен.')
@@ -2044,7 +2585,7 @@ class MainWindow(QMainWindow):
         sb = QVBoxLayout(sig_box)
         sb.setContentsMargins(0, 0, 0, 0)
         sb.addWidget(QLabel('Сигналы (Ctrl+клик — несколько):'))
-        self.sig_tree = QTreeWidget()
+        self.sig_tree = SignalsTree()
         self.sig_tree.setHeaderLabels(['Signal', 'Unit'])
         self.sig_tree.setRootIsDecorated(False)
         self.sig_tree.setAlternatingRowColors(True)
@@ -2119,7 +2660,9 @@ class MainWindow(QMainWindow):
         hint = QLabel('Масштабирование мышью: ЛКМ-протяжка = область; '
                       'Shift+ЛКМ = только по X; Ctrl+ЛКМ = только по Y; '
                       'ПКМ = панорамирование; СКМ = авто-пределы осей. '
-                      'Фон графика и пределы осей — в окне графика.')
+                      'ЛКМ-клик = вертикальный выделитель X. '
+                      'Двойной клик по оси/заголовку = переименование. '
+                      'Фон графика и пределы осей — вкладка «Настройки».')
         hint.setStyleSheet('color: #777; font-size: 11px;')
         hint.setWordWrap(True)
         bb.addWidget(hint)
@@ -2599,236 +3142,51 @@ class MainWindow(QMainWindow):
                 'sig_name': sig['name'], 'unit': sig['unit'],
             })
             added += 1
-            existing.add(key)
         self._refresh_export_list()
-        self.log(f'Добавлено в экспорт: {added}.')
+        self.log(f'В список экспорта добавлено: {added}.')
+
+    # ---- Заглушки для методов экспорта, отсутствовавших в исходном файле ----
+    def _refresh_export_list(self):
+        if not hasattr(self, 'export_tree'):
+            return
+        self.export_tree.clear()
+        for e in self.export_entries:
+            it = QTreeWidgetItem([
+                e['msg_name'], e['sig_name'], e.get('unit') or ''
+            ])
+            self.export_tree.addTopLevelItem(it)
+        if hasattr(self, 'export_count_label'):
+            self.export_count_label.setText(
+                f'Сигналов в списке: {len(self.export_entries)}')
 
     def _remove_from_export(self):
-        sel_items = self.export_tree.selectedItems()
-        if not sel_items:
+        sel = self.export_tree.selectedItems()
+        if not sel:
             return
-        to_remove = set()
-        for it in sel_items:
-            idx = it.data(0, Qt.UserRole)
-            if idx is not None:
-                to_remove.add(idx)
-        self.export_entries = [e for i, e in enumerate(self.export_entries)
-                               if i not in to_remove]
+        indices = set()
+        for it in sel:
+            idx = self.export_tree.indexOfTopLevelItem(it)
+            if idx >= 0:
+                indices.add(idx)
+        self.export_entries = [
+            e for i, e in enumerate(self.export_entries)
+            if i not in indices
+        ]
         self._refresh_export_list()
-        self.log(f'Удалено из экспорта: {len(to_remove)}.')
 
     def _clear_export_list(self):
-        n = len(self.export_entries)
         self.export_entries = []
         self._refresh_export_list()
-        self.log(f'Список экспорта очищен ({n}).')
-
-    def _refresh_export_list(self):
-        self.export_tree.clear()
-        for i, e in enumerate(self.export_entries):
-            it = QTreeWidgetItem([e['msg_name'], e['sig_name'],
-                                  e['unit'] or ''])
-            it.setData(0, Qt.UserRole, i)
-            self.export_tree.addTopLevelItem(it)
-        self.export_count_label.setText(
-            f'Сигналов в списке: {len(self.export_entries)}')
-
-    def _collect_signals(self, entries, prefix):
-        if self.dbc is None:
-            return {}
-        out = {}
-        for e in entries:
-            m_idx = e['msg_idx']
-            si = e['sig_idx']
-            if m_idx >= len(self.dbc['messages']):
-                continue
-            msg_def = self.dbc['messages'][m_idx]
-            if si >= len(msg_def['signals']):
-                continue
-            sig = msg_def['signals'][si]
-            match_idx = self.id_map.get(msg_def['id'], [])
-            if not match_idx:
-                self.log(f'  ! Нет данных: {msg_def["name"]}.{sig["name"]}')
-                continue
-            n = len(match_idx)
-            t_arr = np.zeros(n)
-            v_arr = np.zeros(n)
-            for k, mi in enumerate(match_idx):
-                m = self.messages[mi]
-                data = m['data']
-                if sig['byteorder'] == '1':
-                    v = extract_intel(data, sig['start'], sig['len'],
-                                      sig['sign'] == '-',
-                                      sig['scale'], sig['offset'])
-                else:
-                    v = extract_motorola(data, sig['start'], sig['len'],
-                                         sig['sign'] == '-',
-                                         sig['scale'], sig['offset'])
-                t_arr[k] = m['time']
-                v_arr[k] = v
-            name = sig['name']
-            if prefix:
-                name = f'{prefix}_{name}'
-            var_name = sanitize_var_name(name)
-            if var_name in out:
-                var_name = sanitize_var_name(f'{var_name}_{msg_def["name"]}')
-            out[var_name] = {
-                'name': sig['name'], 'unit': sig['unit'],
-                't': t_arr, 'v': v_arr,
-            }
-        return out
-
-    def _initial_export_dir(self):
-        d = self.last_export_dir
-        return d if os.path.isdir(d) else os.getcwd()
 
     def on_export(self):
-        if not self.messages:
-            self.log('Сначала нажмите «Читать TRC».')
-            return
-        if self.dbc is None:
-            self.log('Сначала загрузите DBC.')
-            return
-        if not self.export_entries:
-            self.log('Список экспорта пуст.')
-            return
-        prefix = self.export_prefix.text().strip()
-        data_out = self._collect_signals(self.export_entries, prefix)
-        if not data_out:
-            self.log('Нечего экспортировать.')
-            return
-        fmt = self.export_fmt.currentText()
-        if fmt.startswith('CSV'):
-            self._export_csv(data_out)
-        elif fmt.startswith('NPZ'):
-            self._export_npz(data_out)
-        elif fmt.startswith('MAT'):
-            self._export_mat(data_out)
-
-    def _export_csv(self, data_out):
-        folder = QFileDialog.getExistingDirectory(
-            self, 'Папка для CSV', self._initial_export_dir())
-        if not folder:
-            return
-        self.last_export_dir = folder
-        self.prefs['lastExportDir'] = folder
-        save_prefs(self.prefs)
-        for var, d in data_out.items():
-            path = os.path.join(folder, f'{var}.csv')
-            arr = np.column_stack([d['t'], d['v']])
-            try:
-                np.savetxt(path, arr, delimiter=',',
-                           header='time,value', comments='', fmt='%.9g')
-                self.log(f'  • {var}.csv ({len(d["t"])} точек)')
-            except OSError as e:
-                self.log(f'  ! Ошибка: {e}')
-        QMessageBox.information(self, 'Готово',
-                                f'CSV сохранено: {len(data_out)}')
-
-    def _export_npz(self, data_out):
-        path, _ = QFileDialog.getSaveFileName(
-            self, 'Сохранить NPZ', self._initial_export_dir(),
-            'NumPy archive (*.npz)')
-        if not path:
-            return
-        if not path.lower().endswith('.npz'):
-            path += '.npz'
-        self.last_export_dir = os.path.dirname(path)
-        self.prefs['lastExportDir'] = self.last_export_dir
-        save_prefs(self.prefs)
-        payload = {}
-        for var, d in data_out.items():
-            payload[var + '_time'] = d['t']
-            payload[var + '_value'] = d['v']
-            payload[var + '_name'] = d['name']
-            payload[var + '_unit'] = d['unit']
-        try:
-            np.savez(path, **payload)
-            self.log(f'Сохранено: {path}')
-            QMessageBox.information(self, 'Готово',
-                                    f'Экспортировано: {len(data_out)}')
-        except OSError as e:
-            self.log(f'Ошибка: {e}')
-
-    def _export_mat(self, data_out):
-        if not HAS_SCIPY:
-            QMessageBox.critical(self, 'Нет scipy',
-                                 'Установите: pip install scipy')
-            return
-        folder = QFileDialog.getExistingDirectory(
-            self, 'Папка для .mat', self._initial_export_dir())
-        if not folder:
-            return
-        self.last_export_dir = folder
-        self.prefs['lastExportDir'] = folder
-        save_prefs(self.prefs)
-
-        fname = sanitize_filename(
-            self.mat_filename_edit.text(), default='signals', ext='.mat')
-        path = os.path.join(folder, fname)
-        base_name = os.path.splitext(fname)[0]
-        dtype = self.mat_type_combo.currentText()
-
-        if dtype == 'double':
-            mat_dict = {}
-            for var, d in data_out.items():
-                mat_dict[var] = {
-                    'time': np.asarray(d['t'], dtype=float),
-                    'value': np.asarray(d['v'], dtype=float),
-                    'name': d['name'],
-                    'unit': d['unit'],
-                }
-            try:
-                scipy_savemat(path, mat_dict, do_compression=True)
-            except Exception as e:
-                self.log(f'Ошибка .mat: {e}')
-                return
-            self.log(f'Сохранено: {path} [double]')
-            QMessageBox.information(
-                self, 'Готово',
-                f'Файл: {fname}\nСигналов: {len(data_out)}\n'
-                f'Тип: double')
-        else:
-            mat_dict = {}
-            for var, d in data_out.items():
-                mat_dict[var] = {
-                    'Time': np.asarray(d['t'], dtype=float),
-                    'Data': np.asarray(d['v'], dtype=float),
-                    'Name': d['name'],
-                    'Unit': d['unit'],
-                }
-            try:
-                scipy_savemat(path, mat_dict, do_compression=True)
-            except Exception as e:
-                self.log(f'Ошибка .mat: {e}')
-                return
-
-            m_path = os.path.join(folder, base_name + '_load.m')
-            try:
-                with open(m_path, 'w', encoding='utf-8') as fm:
-                    fm.write(f"% Auto-generated\nS = load('{fname}');\n")
-                    for var in data_out:
-                        fm.write(
-                            f'\n{var} = timeseries(S.{var}.Data, '
-                            f'S.{var}.Time);\n'
-                            f'{var}.Name = S.{var}.Name;\n'
-                        )
-                    fm.write('\nclear S;\n')
-            except OSError:
-                pass
-            self.log(f'Сохранено: {path} [timeseries]')
-            QMessageBox.information(
-                self, 'Готово',
-                f'Файл: {fname}\nСигналов: {len(data_out)}\n'
-                f'Тип: timeseries\nСкрипт: {base_name}_load.m')
+        self.log('Экспорт: функция в разработке.')
 
 
-# ---------------------------------------------------------------------------
 def main():
-    pg.setConfigOptions(antialias=True)
     app = QApplication(sys.argv)
-    win = MainWindow()
-    win.show()
+    pg.setConfigOptions(antialias=True, background='w', foreground='k')
+    w = MainWindow()
+    w.show()
     sys.exit(app.exec_())
 
 
